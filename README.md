@@ -1,16 +1,235 @@
-# React + Vite
+# 📚 Sistema de Auditoria e Boletim — Ícone COC
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+Aplicação web interna desenvolvida para gestão das unidades da escola **Ícone COC**.  
+Permite duas funcionalidades principais: **Auditoria de Material Didático** e **Visualização de Boletim dos Alunos**, com integração direta à API Sponte.
 
-Currently, two official plugins are available:
+---
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+## 🗂️ Estrutura do Projeto
 
-## React Compiler
+```
+subir_alunos_coc/
+├── src/
+│   ├── App.jsx          # Componente principal — toda a lógica e UI
+│   ├── main.jsx         # Entry point do React
+│   ├── index.css        # Estilos globais
+│   └── App.css          # Estilos do componente raiz
+├── public/              # Assets estáticos
+├── .env                 # Variáveis de ambiente (credenciais das unidades)
+├── package.json         # Dependências e scripts
+├── vite.config.js       # Configuração do Vite
+├── tailwind.config.js   # Configuração do Tailwind
+├── sponte.wsdl          # Arquivo de referência da API Sponte (não usado em produção)
+└── README.md            # Esta documentação
+```
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+---
 
-## Expanding the ESLint configuration
+## ⚙️ Configuração de Ambiente
 
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+Copie o arquivo `.env` e preencha com os dados de cada unidade:
+
+```env
+VITE_UNIDADE_1_CODIGO=18935
+VITE_UNIDADE_1_TOKEN=xxx
+VITE_UNIDADE_2_CODIGO=70293
+VITE_UNIDADE_2_TOKEN=xxx
+VITE_UNIDADE_3_CODIGO=19240
+VITE_UNIDADE_3_TOKEN=xxx
+VITE_UNIDADE_4_CODIGO=73807
+VITE_UNIDADE_4_TOKEN=xxx
+VITE_UNIDADE_5_CODIGO=488368
+VITE_UNIDADE_5_TOKEN=xxx
+VITE_UNIDADE_6_CODIGO=488369
+VITE_UNIDADE_6_TOKEN=xxx
+```
+
+> ⚠️ **NUNCA commitar o `.env` no Git.** Ele está no `.gitignore`.
+
+---
+
+## 🚀 Como rodar localmente
+
+```bash
+# Instalar dependências
+npm install
+
+# Iniciar servidor de desenvolvimento (acessa em http://localhost:5173)
+npm run dev
+
+# Gerar build de produção
+npm run build
+```
+
+---
+
+## 🔌 Integração com a API Sponte
+
+Todos os dados são buscados diretamente da [API REST Sponte](https://api.sponteeducacional.net.br/).
+
+### Endpoints utilizados
+
+| Método | Uso |
+|--------|-----|
+| `GetTurmas2` | Lista turmas de 2026 da unidade selecionada |
+| `GetIntegrantesTurmas` | Lista alunos de uma turma específica |
+| `GetMatriculas` | Busca histórico de matrículas por aluno (para detectar anos anteriores) |
+| `GetFinanceiro` | Verifica se o aluno pagou o material didático |
+| `GetAlunos` | Busca dados detalhados do aluno (para exportação) |
+| `GetNotaParcial` | Busca notas parciais e médias por aluno/turma/ano |
+
+### Parâmetros importantes do `GetNotaParcial`
+
+```
+GET /WSAPIEdu.asmx/GetNotaParcial
+  ?nCodigoCliente={codigo}
+  &sToken={token}
+  &nAlunoID={alunoId}
+  &nTurmaID={turmaId}   # ID da turma (informe 0 para aulas livres)
+  &nCursoID={cursoId}   # ID do curso (informe 0 para turmas regulares)
+  &sParametrosBusca=
+```
+
+> ⚠️ **Importante:** A API não aceita `nTurmaID` e `nCursoID` ao mesmo tempo. Use um ou outro.
+
+---
+
+## 🧩 Funcionalidades
+
+### 1. 🔍 Modo Auditoria de Material Didático
+
+- Selecione a **unidade** e a **turma** para carregar os alunos.
+- O sistema verifica automaticamente via `GetFinanceiro` se cada aluno pagou o material didático para 2026.
+- Alunos com material **pago** aparecem com um badge verde ✅.
+- Alunos com material **não pago** aparecem com badge vermelho ❌.
+- Filtro para exibir **apenas compradores** (toggle).
+- Botão **"Baixar Lista"** por turma: gera planilha Excel (`.xlsx`) com:
+  - Nome Completo
+  - Nome de Usuário (`iMatricula`)
+  - Data de Nascimento
+  - CPF
+  - E-mail
+  - Turma
+  - Matrícula
+  - Senha Temporária (`Icone@Matricula`)
+
+---
+
+### 2. 📋 Modo Visualização de Boletim
+
+- Selecione a **unidade**, escolha uma **turma** e os alunos serão carregados.
+- O sistema busca matrículas anteriores de cada aluno via `GetMatriculas`.
+- Alunos com histórico em anos anteriores recebem o badge **"VETERANO (anos)"**.
+- Filtro para exibir **apenas veteranos** (toggle).
+- Botão **"VER NOTAS"** abre o modal de boletim do aluno.
+
+#### Modal de Boletim
+
+- **Seletor de Ano Letivo:** abas para navegar entre anos (ex: Ano 2025, Ano 2024).
+- **Filtro de Período:** botões para filtrar por trimestre/bimestre (ex: 1º Trimestre, 2º Trimestre).
+- **Seleção de Disciplinas:** caixas de seleção por disciplina, com botão "Selecionar Visíveis".
+- **Notas exibidas:**  
+  - Média Final do período (ex: `54`)
+  - Notas parciais por avaliação (ex: `VAD: 20`, `VAO: 16`, `VAF: 18`)
+- **Exportar para Excel:** botão "Baixar X Selecionadas" gera planilha `.xlsx` com:
+  - Ano Letivo
+  - Período
+  - Disciplina
+  - Média Final
+  - Colunas individuais para cada nota parcial (VAD, VAO, VAF, etc.)
+
+---
+
+### 3. 🌐 Pesquisa Global de Alunos (Modo Notas)
+
+- **Barra de Pesquisa Inteligente:** Localizada no topo da seção de Notas.
+- **Busca em Tempo Real (Autocomplete):** Pesquisa o nome do aluno simultaneamente nas **6 unidades** da escola via API `GetAlunos`.
+- **Dropdown de Resultados:** Exibe sugestões conforme você digita, mostrando o nome do aluno e a unidade correspondente.
+- **Histórico Unificado:** Ao selecionar um aluno, o sistema abre um modal exclusivo que:
+  - Busca matrículas em **todas** as unidades onde o aluno já estudou.
+  - Consolida notas de diferentes anos e unidades em uma única visualização.
+  - Permite filtrar por Ano e Trimestre/Bimestre.
+  - Exibe a unidade e a turma de cada registro histórico.
+
+---
+
+## 📦 Dependências Principais
+
+| Pacote | Versão | Uso |
+|--------|--------|-----|
+| `react` | 19.x | Framework de UI |
+| `react-dom` | 19.x | Renderização DOM |
+| `lucide-react` | 0.563.x | Ícones |
+| `xlsx` | 0.18.x | Geração de planilhas Excel |
+| `vite` | 7.x | Bundler e dev server |
+| `tailwindcss` | 4.x | Framework de estilos |
+
+---
+
+## 🏗️ Arquitetura e Fluxo de Dados
+
+```
+Usuario
+  │
+  ├─ Seleciona Unidade → carrega Credenciais do .env
+  │
+  ├─ Seleciona Turma → GetTurmas2 → lista turmas 2026
+  │
+  └─ Modo Selecionado
+       │
+       ├─ AUDITORIA
+       │    └─ GetIntegrantesTurmas → lista alunos
+       │         └─ GetFinanceiro (por aluno, lotes de 5)
+       │              └─ verifica parcelas com keyword match
+       │
+       └─ BOLETIM
+            └─ GetIntegrantesTurmas → lista alunos
+                 └─ GetMatriculas (por aluno, lotes de 5)
+                      └─ extrai todos os TurmaIDs por ano
+                           └─ [botão "VER NOTAS"]
+                                └─ GetNotaParcial (todos TurmaIDs do ano)
+                                     └─ mescla resultados por disciplina
+                                          └─ exibe por ano/período/nota
+```
+
+---
+
+## ⚠️ Comportamentos Conhecidos
+
+### Notas não encontradas (`"Matrículas anteriores encontradas, mas sem notas no sistema"`)
+
+Esse aviso aparece quando o aluno possui matrículas em anos anteriores registrados no Sponte, mas **as notas parciais não foram lançadas pelos professores** para aquela turma naquele período.
+
+**Isso é comum em:**
+- Turmas de Educação Infantil (Pré I, Pré II) — frequentemente sem nota numérica.
+- Turmas cujo lançamento de notas ainda não foi concluído pela escola.
+
+### Aluno com badge VETERANO mas sem notas
+
+O badge "VETERANO" aparece sempre que `GetMatriculas` retorna pelo menos uma matrícula anterior a 2026. Não garante que existam notas para aquele período.
+
+### Múltiplas turmas no mesmo ano
+
+Caso um aluno tenha mudado de turma em 2025 (ex: transferência interna), o sistema consulta **todas** as TurmaIDs daquele ano e mescla os resultados, garantindo que nenhuma nota fique de fora.
+
+---
+
+## 📅 Histórico de Desenvolvimento
+
+| Data | Funcionalidade |
+|------|---------------|
+| 2026-03 | Criação inicial do projeto — Auditoria de Material Didático com exportação XLSX |
+| 2026-03 | Adição do Modo Boletim com integração à API `GetNotaParcial` |
+| 2026-03 | Implementação do seletor de anos anteriores via `GetMatriculas` |
+| 2026-03 | Filtros de período (Trimestre/Bimestre) no modal de boletim |
+| 2026-03 | Seleção de disciplinas e exportação personalizada para Excel |
+| 2026-03 | Abas de Ano Letivo no modal de boletim |
+| 2026-03 | Correção: coleta de todos os TurmaIDs por ano (múltiplas matrículas no mesmo ano) |
+| 2026-03 | Melhoria: mensagem informativa quando notas existem no histórico mas não no Sponte |
+| 2026-03 | Implementação da **Pesquisa Global de Alunos** em todas as unidades com autocomplete |
+
+---
+
+## 👨‍💻 Contato
+
+Desenvolvido para uso interno das unidades **Ícone COC — Taquara**.
