@@ -20,7 +20,7 @@ subir_alunos_coc/
 ├── vite.config.js       # Configuração do Vite
 ├── tailwind.config.js   # Configuração do Tailwind
 ├── sponte.wsdl          # Arquivo de referência da API Sponte (não usado em produção)
-└── README.md            # Esta documentação
+└── README.md            # Esta documentação OFICIAL do projeto
 ```
 
 ---
@@ -66,6 +66,17 @@ npm run build
 ## 🔌 Integração com a API Sponte
 
 Todos os dados são buscados diretamente da [API REST Sponte](https://api.sponteeducacional.net.br/).
+
+### Chamada Principal: `callSponteForUnit`
+Localizada em `App.jsx`, esta constante centraliza todas as requisições de rede:
+- **unidadeKey:** Identifica qual unidade (token/código no `.env`) usar.
+- **method:** O endpoint do Sponte (ex: `GetAlunos`).
+- **params:** Parâmetros da query formatados.
+
+### Fluxo de Recuperação de Dados
+1. **Dados Cadastrais:** Requisição `GetAlunos` com `alunoid` para obter CPF, Nascimento, Matrícula e Email.
+2. **Histórico:** `GetMatriculas` para identificar anos/turmas anteriores.
+3. **Extração de Notas:** `GetNotaParcial` percorre cada `wsNotaParcial` para capturar médias e sub-notas (VAD, VAO, VAF).
 
 ### Endpoints utilizados
 
@@ -150,6 +161,9 @@ GET /WSAPIEdu.asmx/GetNotaParcial
   - Consolida notas de diferentes anos e unidades em uma única visualização.
   - Permite filtrar por Ano e Trimestre/Bimestre.
   - Exibe a unidade e a turma de cada registro histórico.
+- **Botões de Cópia Direta:** Implementados nos campos Nome (header), Matrícula, Nascimento e CPF.
+  - **Feedback:** Ícone de "check" verde por 2 segundos após a cópia.
+- **Visualização de Notas Parciais:** Badges laranja exibem o detalhamento (VAD, VAO, VAF) logo abaixo da média de cada disciplina.
 
 ---
 
@@ -194,6 +208,19 @@ Usuario
 
 ---
 
+## 🔄 Arquitetura para Futura Migração (Outros ERPs)
+
+A aplicação foi estruturada para facilitar a troca do Sponte por outro sistema no futuro:
+
+1. **Adapter de API:** Criar uma nova função de rede (ex: `callOtherSystem`) no lugar da `callSponteForUnit`.
+2. **Normalização de Dados:** O front-end espera que os dados de notas cheguem normalizados através do parser (`parseExtrato`) no seguinte formato:
+   ```javascript
+   { disciplina: "NOME", nome: "PERÍODO", notaFinal: "VALOR", subNotas: [{ nome: "TIPO", nota: "VALOR" }] }
+   ```
+3. **Configuração Multi-Unidade:** Basta expandir a `UNIDADES_CONFIG` no topo para suportar diferentes terminais da nova API.
+
+---
+
 ## ⚠️ Comportamentos Conhecidos
 
 ### Notas não encontradas (`"Matrículas anteriores encontradas, mas sem notas no sistema"`)
@@ -227,6 +254,9 @@ Caso um aluno tenha mudado de turma em 2025 (ex: transferência interna), o sist
 | 2026-03 | Correção: coleta de todos os TurmaIDs por ano (múltiplas matrículas no mesmo ano) |
 | 2026-03 | Melhoria: mensagem informativa quando notas existem no histórico mas não no Sponte |
 | 2026-03 | Implementação da **Pesquisa Global de Alunos** em todas as unidades com autocomplete |
+| 2026-03 | Adição de botões de cópia com feedback visual (Check verde) |
+| 2026-03 | Implementação da visualização detalhada de **Notas Parciais (VAD/VAO/VAF)** |
+| 2026-03 | Padronização Visual Laranja e Consolidação da Documentação Técnica |
 
 ---
 

@@ -1,6 +1,6 @@
-import React, { useState, useRef, useCallback, useEffect } from 'react';
+﻿import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe } from 'lucide-react';
+import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy } from 'lucide-react';
 
 const App = () => {
   const [loadingTurmas, setLoadingTurmas] = useState(false);
@@ -13,7 +13,7 @@ const App = () => {
   const [selectedUnidade, setSelectedUnidade] = useState('unidade_2');
   const [filtroCompradores, setFiltroCompradores] = useState(false);
   const [downloadingTurmaId, setDownloadingTurmaId] = useState(null);
-  const [viewMode, setViewMode] = useState('auditoria'); // 'auditoria' | 'notas'
+  const [viewMode, setViewMode] = useState('welcome'); // 'welcome' | 'auditoria' | 'notas'
   const [filtroVeteranos, setFiltroVeteranos] = useState(false);
   const [selectedBoletim, setSelectedBoletim] = useState(null);
   const [loadingBoletim, setLoadingBoletim] = useState(false);
@@ -29,8 +29,25 @@ const App = () => {
   const [globalBoletim, setGlobalBoletim] = useState(null); // { aluno, unidadeNome, loading, resultados }
   const [globalAnoBol, setGlobalAnoBol] = useState(null);
   const [globalPeriodo, setGlobalPeriodo] = useState('Todos');
+  const [globalDetalhes, setGlobalDetalhes] = useState(null); // { aluno, loading, data }
+  const [globalDetalhesTab, setGlobalDetalhesTab] = useState('dados'); // 'dados' | 'notas'
+  const [copiedField, setCopiedField] = useState(null); // tracks which field was just copied
   const searchDebounceRef = useRef(null);
   const searchInputRef = useRef(null);
+
+  const [savedStudents, setSavedStudents] = useState(() => {
+    const saved = localStorage.getItem('savedStudents');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [exportingSavedStudents, setExportingSavedStudents] = useState(false);
+  const [exportModalData, setExportModalData] = useState(null); // { allRows, uniqueDisciplines }
+  const [selectedExportDisciplines, setSelectedExportDisciplines] = useState(new Set());
+  const [exportProgress, setExportProgress] = useState(null);
+  const [exportErrors, setExportErrors] = useState([]);
+
+  useEffect(() => {
+    localStorage.setItem('savedStudents', JSON.stringify(savedStudents));
+  }, [savedStudents]);
 
   // Configuração das unidades (Tokens e Códigos agora estão no Backend)
   // Configuração das unidades
@@ -65,29 +82,264 @@ const App = () => {
     setGlobalSearchLoading(true);
     const unidades = Object.keys(UNIDADES_CONFIG);
     const results = [];
+
+    const removeAccents = (str) => str.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+    const searchTerms = removeAccents(query).split(/\s+/).filter(t => t.length > 0);
+
+    // Precisamos enviar um termo príncipal para a API. Pegamos a primeira palavra com 3+ letras, ou a 1ª palavra.
+    const apiSearchTerm = searchTerms.find(t => t.length >= 3) || searchTerms[0];
+
     await Promise.all(unidades.map(async (uKey) => {
-      const xml = await callSponteForUnit(uKey, 'GetAlunos', `nome=${encodeURIComponent(query.trim())}`);
+      const xml = await callSponteForUnit(uKey, 'GetAlunos', `nome=${encodeURIComponent(apiSearchTerm)}`);
       if (!xml) return;
       const nodes = Array.from(xml.getElementsByTagName('wsAluno'));
       nodes.forEach(node => {
         const id = node.getElementsByTagName('AlunoID')[0]?.textContent;
         const nome = node.getElementsByTagName('Nome')[0]?.textContent;
         if (id && id !== '0' && nome) {
-          results.push({ id, nome, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
+          const nomeNormalizado = removeAccents(nome);
+          // Verifica se TODAS as partes pesquisadas estão no nome do aluno (não importando a ordem ou distância)
+          const matchesAll = searchTerms.every(term => nomeNormalizado.includes(term));
+
+          if (matchesAll) {
+            results.push({ id, nome, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
+          }
         }
       });
     }));
-    // Deduplicate by id (same student can exist in multiple unit systems)
-    const seen = new Set();
-    const unique = results.filter(r => {
-      const k = `${r.unidadeKey}-${r.id}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
+
+    // Agrupar estudantes pelo nome (mesmo estudante em várias unidades)
+    const grouped = new Map();
+    results.forEach(r => {
+      const gName = removeAccents(r.nome);
+      if (!grouped.has(gName)) {
+        grouped.set(gName, { nome: r.nome, id: r.id, unidadeKey: r.unidadeKey, unidadeNome: r.unidadeNome, unidades: [] });
+      }
+      const group = grouped.get(gName);
+      if (!group.unidades.some(u => u.unidadeKey === r.unidadeKey)) {
+        group.unidades.push({ id: r.id, unidadeKey: r.unidadeKey, unidadeNome: r.unidadeNome });
+      }
     });
-    setGlobalSearchResults(unique.slice(0, 15));
+
+    const finalResults = Array.from(grouped.values()).slice(0, 15);
+    setGlobalSearchResults(finalResults);
     setGlobalSearchLoading(false);
   }, [callSponteForUnit]);
+
+  // Exportar Alunos Salvos para Excel
+  const handleExportSavedStudents = async () => {
+    if (savedStudents.length === 0) return;
+    setExportingSavedStudents(true);
+    setExportProgress({ current: 0, total: savedStudents.length, studentName: '' });
+    setExportErrors([]);
+
+    try {
+      const allRows = [];
+      let currentIdx = 0;
+
+      // Loop pelos alunos salvos
+      for (const student of savedStudents) {
+        currentIdx++;
+        setExportProgress({ current: currentIdx, total: savedStudents.length, studentName: student.nome });
+
+        try {
+          const studentUnits = student.unidades && student.unidades.length > 0
+            ? student.unidades
+            : [{ id: student.id, unidadeKey: student.unidadeKey, unidadeNome: student.unidadeNome }];
+
+          let studentGradesMap = new Map(); // key: disciplina -> value: object de notas
+          const anoGeralMap = {}; // aggregated map for ALL units: { '2025': [ {turmaId, unidadeKey, unidadeNome} ] }
+
+          // Loop pelas unidades do aluno (agora apenas para coletar as matrículas e anos)
+          for (const unit of studentUnits) {
+            const matriculasXml = await callSponteForUnit(unit.unidadeKey, 'GetMatriculas', `alunoid=${unit.id}`);
+            if (!matriculasXml) continue;
+            const mats = Array.from(matriculasXml.getElementsByTagName('wsMatricula'));
+
+            mats.forEach(m => {
+              const dataInicio = m.getElementsByTagName('DataInicio')[0]?.textContent || '';
+              const dataMatricula = m.getElementsByTagName('DataMatricula')[0]?.textContent || '';
+              let ano = '';
+              if (dataInicio.includes('/')) ano = dataInicio.split(' ')[0].split('/')[2];
+              else if (dataInicio.includes('-')) ano = dataInicio.split('T')[0].split('-')[0];
+              if (!ano && dataMatricula.includes('/')) ano = dataMatricula.split(' ')[0].split('/')[2];
+              else if (!ano && dataMatricula.includes('-')) ano = dataMatricula.split('T')[0].split('-')[0];
+              if (!ano) ano = m.getElementsByTagName('AnoLetivo')[0]?.textContent || '';
+
+              const turmaId = m.getElementsByTagName('TurmaID')[0]?.textContent || '';
+
+              if (ano && ano.length === 4 && turmaId) {
+                if (!anoGeralMap[ano]) anoGeralMap[ano] = [];
+                // Evita duplicar a mesma turma para o mesmo ano/unidade
+                if (!anoGeralMap[ano].some(t => t.turmaId === turmaId && t.unidadeKey === unit.unidadeKey)) {
+                  anoGeralMap[ano].push({ turmaId, unidadeKey: unit.unidadeKey, unidadeNome: unit.unidadeNome, alunoId: unit.id });
+                }
+              }
+            });
+          }
+
+          const anosOrdenadosGerais = Object.keys(anoGeralMap).sort((a, b) => b.localeCompare(a));
+
+          // Busca as notas nas turmas, descendo do ano mais recente GERAL para o mais antigo GERAL
+          // Assim que encontrar UM ano com notas em qualquer unidade, para a busca.
+          for (const anoToTest of anosOrdenadosGerais) {
+            let foundGradesThisYear = false;
+
+            // Para cada turma (em qualquer unidade) vinculada a este ano
+            for (const turmaInfo of anoGeralMap[anoToTest]) {
+              const npXml = await callSponteForUnit(turmaInfo.unidadeKey, 'GetNotaParcial', `&nAlunoID=${turmaInfo.alunoId}&nTurmaID=${turmaInfo.turmaId}&nCursoID=0&sParametrosBusca=`, true);
+              if (!npXml) continue;
+
+              const disciplinasNodes = Array.from(npXml.getElementsByTagName('wsDisciplinasNotasParciais'));
+              disciplinasNodes.forEach(discNode => {
+                const periodos = Array.from(discNode.getElementsByTagName('wsNotasPeriodos'));
+
+                periodos.forEach(perNode => {
+                  const nomePeriodoStr = (perNode.getElementsByTagName('NomePeriodo')[0]?.textContent || '').toUpperCase();
+                  const trimMatch = nomePeriodoStr.match(/(\d)º\s*TRIMESTRE/);
+                  if (trimMatch) {
+                    foundGradesThisYear = true; // Achou notas de trimestre neste ano GERAL
+
+                    const disciplinaNome = discNode.getElementsByTagName('NomeDisciplina')[0]?.textContent || 'Desconhecida';
+                    if (!studentGradesMap.has(disciplinaNome)) {
+                      studentGradesMap.set(disciplinaNome, {
+                        'Aluno': student.nome,
+                        'Unidade': turmaInfo.unidadeNome, // Usa a unidade de onde a nota realmente veio
+                        'Ano Letivo': anoToTest,
+                        'Disciplina': disciplinaNome,
+                        '1º Trim (Nota)': '-', '1º Trim (VAD)': '-', '1º Trim (VAO)': '-', '1º Trim (VAF)': '-',
+                        '2º Trim (Nota)': '-', '2º Trim (VAD)': '-', '2º Trim (VAO)': '-', '2º Trim (VAF)': '-',
+                        '3º Trim (Nota)': '-', '3º Trim (VAD)': '-', '3º Trim (VAO)': '-', '3º Trim (VAF)': '-'
+                      });
+                    }
+
+                    const cols = studentGradesMap.get(disciplinaNome);
+                    const trim = trimMatch[1]; // '1', '2' ou '3'
+                    cols[`${trim}º Trim (Nota)`] = perNode.getElementsByTagName('MediaPrevista')[0]?.textContent || '-';
+
+                    const parciais = Array.from(perNode.getElementsByTagName('wsNotaParcial'));
+                    parciais.forEach(np => {
+                      const nomeAval = (np.getElementsByTagName('NomeAvaliacao')[0]?.textContent || '').toUpperCase();
+                      const val = np.getElementsByTagName('Nota')[0]?.textContent || '-';
+                      if (nomeAval.includes('VAD')) cols[`${trim}º Trim (VAD)`] = val;
+                      if (nomeAval.includes('VAO')) cols[`${trim}º Trim (VAO)`] = val;
+                      if (nomeAval.includes('VAF')) cols[`${trim}º Trim (VAF)`] = val;
+                    });
+                  }
+                });
+              });
+            }
+
+            if (foundGradesThisYear) {
+              // Encerra a busca ao encontrar qualquer nota válida do aluno no ano mais atual possível
+              break;
+            }
+          }
+
+          // Adiciona as linhas do aluno à planilha final
+          studentGradesMap.forEach(row => allRows.push(row));
+        } catch (innerErr) {
+          console.error(`Erro ao buscar notas do aluno ${student.nome}:`, innerErr);
+          setExportErrors(prev => [...prev, student.nome]);
+        }
+      }
+
+      setExportProgress(null);
+
+      if (allRows.length === 0) {
+        alert("Não foram encontradas notas nos padrões (1º, 2º, 3º Trimestre) para os alunos da lista.");
+        setExportingSavedStudents(false);
+        return;
+      }
+
+      // Instead of downloading directly, extract unique disciplines and show modal
+      const uniqueDisciplines = [...new Set(allRows.map(row => row.Disciplina))].sort((a, b) => a.localeCompare(b));
+      setExportModalData({ allRows, uniqueDisciplines });
+      setSelectedExportDisciplines(new Set(uniqueDisciplines)); // All selected by default
+
+    } catch (err) {
+      console.error(err);
+      alert("Houve um erro ao buscar as notas para exportação.");
+    } finally {
+      setExportingSavedStudents(false);
+    }
+  };
+
+  // Executa o download real em Excel filtrando apenas pelas disciplinas checadas
+  const confirmExportSelection = () => {
+    if (!exportModalData) return;
+
+    try {
+      const { allRows } = exportModalData;
+      // Filter rows
+      const filteredRows = allRows.filter(row => selectedExportDisciplines.has(row.Disciplina));
+
+      if (filteredRows.length === 0) {
+        alert("Selecione pelo menos uma disciplina antes de exportar.");
+        return;
+      }
+
+      const ws = XLSX.utils.json_to_sheet(filteredRows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, `Notas Consolidadas`);
+      XLSX.writeFile(wb, `Notas_Alunos_Salvos_${new Date().getTime()}.xlsx`);
+
+      setExportModalData(null); // Close modal
+    } catch (err) {
+      console.error(err);
+      alert("Houve um erro ao gerar a planilha Excel.");
+    }
+  };
+
+  // Abre detalhes do aluno da pesquisa global (dados primeiro, notas depois)
+  const fetchGlobalDetalhes = async (alunoResult) => {
+    setGlobalDetalhes({ aluno: alunoResult, loading: true, data: null });
+    setGlobalDetalhesTab('dados');
+    setGlobalSearchOpen(false);
+    setGlobalSearch(alunoResult.nome);
+
+    try {
+      // Pega o ID do aluno na primeira unidade disponível
+      const primeiraUnidade = alunoResult.unidades && alunoResult.unidades.length > 0
+        ? alunoResult.unidades[0]
+        : { id: alunoResult.id, unidadeKey: alunoResult.unidadeKey };
+
+      const xml = await callSponteForUnit(primeiraUnidade.unidadeKey, 'GetAlunos', `alunoid=${primeiraUnidade.id}`);
+      const alunoNode = xml?.getElementsByTagName('wsAluno')[0];
+
+      if (alunoNode) {
+        let dataNasc = alunoNode.getElementsByTagName('DataNascimento')[0]?.textContent || '';
+        if (dataNasc) {
+          try {
+            if (dataNasc.includes('T')) dataNasc = dataNasc.split('T')[0];
+            if (dataNasc.match(/^\d{4}-\d{2}-\d{2}$/)) {
+              const [y, m, d] = dataNasc.split('-');
+              dataNasc = `${d}/${m}/${y}`;
+            } else if (dataNasc.match(/^\d{1,2}\/\d{1,2}\/\d{4}$/)) {
+              const [d, m, y] = dataNasc.split('/');
+              dataNasc = `${d.padStart(2, '0')}/${m.padStart(2, '0')}/${y}`;
+            }
+          } catch (e) { }
+        }
+        const matricula = alunoNode.getElementsByTagName('NumeroMatricula')[0]?.textContent || alunoNode.getElementsByTagName('RA')[0]?.textContent || '';
+        setGlobalDetalhes({
+          aluno: alunoResult,
+          loading: false,
+          data: {
+            matricula,
+            dataNascimento: dataNasc || '--',
+            cpf: alunoNode.getElementsByTagName('CPF')[0]?.textContent || '--',
+            email: alunoNode.getElementsByTagName('Email')[0]?.textContent || '--',
+            responsavel: 'Consultar Secretaria',
+          }
+        });
+      } else {
+        setGlobalDetalhes({ aluno: alunoResult, loading: false, data: null, error: 'Dados não encontrados.' });
+      }
+    } catch (err) {
+      setGlobalDetalhes({ aluno: alunoResult, loading: false, data: null, error: 'Erro ao carregar dados.' });
+    }
+  };
 
   // Carrega boletim completo do aluno em TODAS as unidades
   const fetchGlobalBoletim = async (alunoResult) => {
@@ -122,7 +374,20 @@ const App = () => {
     const resultados = {}; // { unidadeKey: { unidadeNome, anos: { '2025': [...], ... } } }
 
     await Promise.all(Object.keys(UNIDADES_CONFIG).map(async (uKey) => {
-      const matriculasXml = await callSponteForUnit(uKey, 'GetMatriculas', `alunoid=${alunoResult.id}`);
+      // Encontra o ID correto deste aluno nesta unidade específica
+      let targetId = null;
+      if (alunoResult.unidades && alunoResult.unidades.length > 0) {
+        const uInfo = alunoResult.unidades.find(u => u.unidadeKey === uKey);
+        if (uInfo) targetId = uInfo.id;
+      } else {
+        // Fallback para pesquisas salvas antigas
+        targetId = alunoResult.id;
+      }
+
+      // Se não tem ID correspondente para esta unidade, pule
+      if (!targetId) return;
+
+      const matriculasXml = await callSponteForUnit(uKey, 'GetMatriculas', `alunoid=${targetId}`);
       if (!matriculasXml) return;
       const mats = Array.from(matriculasXml.getElementsByTagName('wsMatricula'));
       if (mats.length === 0) return;
@@ -150,12 +415,12 @@ const App = () => {
       for (const [ano, { turmaIds, nomeTurma }] of Object.entries(anoMap)) {
         let extratoAno = [];
         for (const turmaId of turmaIds) {
-          const npXml = await callSponteForUnit(uKey, 'GetNotaParcial', `&nAlunoID=${alunoResult.id}&nTurmaID=${turmaId}&nCursoID=0&sParametrosBusca=`, true);
+          const npXml = await callSponteForUnit(uKey, 'GetNotaParcial', `&nAlunoID=${targetId}&nTurmaID=${turmaId}&nCursoID=0&sParametrosBusca=`, true);
           if (npXml) {
             parseExtrato(npXml).forEach(d => { if (!extratoAno.some(e => e.id === d.id)) extratoAno.push(d); });
           }
         }
-        if (extratoAno.length > 0) anosResult[ano] = { disciplinas: extratoAno, nomeTurma };
+        anosResult[ano] = { disciplinas: extratoAno, nomeTurma, temNotas: extratoAno.length > 0 };
       }
 
       if (Object.keys(anosResult).length > 0) {
@@ -163,9 +428,22 @@ const App = () => {
       }
     }));
 
-    const firstAno = Object.values(resultados)
-      .flatMap(u => Object.keys(u.anos))
-      .sort((a, b) => b.localeCompare(a))[0] || null;
+    const anosDisponiveis = [...new Set(
+      Object.values(resultados).flatMap(u => Object.keys(u.anos))
+    )].sort((a, b) => b.localeCompare(a));
+
+    let firstAno = anosDisponiveis[0] || null;
+
+    // Busca o primeiro ano que realmente tenha notas
+    for (const ano of anosDisponiveis) {
+      const anoTemNotas = Object.values(resultados).some(
+        u => u.anos[ano] && u.anos[ano].temNotas
+      );
+      if (anoTemNotas) {
+        firstAno = ano;
+        break;
+      }
+    }
 
     setGlobalBoletim({ aluno: alunoResult, loading: false, resultados });
     setGlobalAnoBol(firstAno);
@@ -725,8 +1003,231 @@ const App = () => {
   return (
     <div className="min-h-screen bg-[#f3f4f6] p-4 md:p-8 font-sans text-slate-900 antialiased selection:bg-orange-100">
 
+      {/* MODAL DE DETALHES GLOBAL (PESQUISA) */}
+      {globalDetalhes && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => { setGlobalDetalhes(null); setGlobalBoletim(null); }}>
+          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-md max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div className="bg-slate-900 p-6 text-white relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
+              <div className="relative z-10 flex items-start justify-between">
+                <div className="flex items-center gap-4">
+                  <div className="w-12 h-12 rounded-2xl bg-green-500 flex items-center justify-center font-black text-lg text-white shadow-lg shadow-green-900/20">
+                    {globalDetalhes.aluno.nome.charAt(0)}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{globalDetalhes.aluno.nome}</h3>
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(globalDetalhes.aluno.nome); setCopiedField('nome'); setTimeout(() => setCopiedField(null), 2000); }}
+                        className="p-1 rounded-lg bg-white/10 hover:bg-orange-500 text-slate-300 hover:text-white transition-all flex-shrink-0"
+                        title="Copiar nome"
+                      >
+                        {copiedField === 'nome' ? <CheckCircle size={13} /> : <Copy size={13} />}
+                      </button>
+                    </div>
+                    <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Detalhes do Aluno</p>
+                  </div>
+                </div>
+                <button onClick={() => { setGlobalDetalhes(null); setGlobalBoletim(null); }} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
+                  <XCircle size={20} className="text-white" />
+                </button>
+              </div>
+              {/* Tabs: Dados | Notas */}
+              <div className="flex gap-2 mt-5">
+                <button
+                  onClick={() => setGlobalDetalhesTab('dados')}
+                  className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalDetalhesTab === 'dados' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
+                >
+                  Dados
+                </button>
+                <button
+                  onClick={() => {
+                    setGlobalDetalhesTab('notas');
+                    if (!globalBoletim || globalBoletim.aluno.nome !== globalDetalhes.aluno.nome) {
+                      fetchGlobalBoletim(globalDetalhes.aluno);
+                    }
+                  }}
+                  className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-1.5 ${globalDetalhesTab === 'notas' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
+                >
+                  <GraduationCap size={12} /> Notas
+                </button>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div className="p-6 flex-1 overflow-y-auto">
+              {globalDetalhesTab === 'dados' ? (
+                globalDetalhes.loading ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando Informações...</p>
+                  </div>
+                ) : globalDetalhes.error ? (
+                  <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">{globalDetalhes.error}</div>
+                ) : globalDetalhes.data ? (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5"><User size={10} /> Matrícula</p>
+                          <button onClick={() => { navigator.clipboard.writeText(globalDetalhes.data.matricula || ''); setCopiedField('matricula'); setTimeout(() => setCopiedField(null), 2000); }} className="p-0.5 rounded text-slate-300 hover:text-orange-500 transition-colors" title="Copiar">
+                            {copiedField === 'matricula' ? <CheckCircle size={11} className="text-green-500" /> : <Copy size={11} />}
+                          </button>
+                        </div>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.matricula || '--'}</p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5"><Calendar size={10} /> Nascimento</p>
+                          <button onClick={() => { navigator.clipboard.writeText(globalDetalhes.data.dataNascimento || ''); setCopiedField('nasc'); setTimeout(() => setCopiedField(null), 2000); }} className="p-0.5 rounded text-slate-300 hover:text-orange-500 transition-colors" title="Copiar">
+                            {copiedField === 'nasc' ? <CheckCircle size={11} className="text-green-500" /> : <Copy size={11} />}
+                          </button>
+                        </div>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.dataNascimento}</p>
+                      </div>
+                    </div>
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-orange-100 transition-colors group">
+                        <div className="w-10 h-10 rounded-xl bg-orange-50 flex items-center justify-center text-orange-500 group-hover:bg-orange-500 group-hover:text-white transition-colors"><User size={18} /></div>
+                        <div>
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">CPF</p>
+                          <p className="font-bold text-slate-700 font-mono text-sm">{globalDetalhes.data.cpf}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 transition-colors group">
+                        <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-500 group-hover:bg-blue-500 group-hover:text-white transition-colors"><div className="scale-75"><User size={20} /></div></div>
+                        <div className="overflow-hidden">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Email</p>
+                          <p className="font-bold text-slate-700 text-sm truncate">{globalDetalhes.data.email}</p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100">
+                        <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500"><Users size={18} /></div>
+                        <div>
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Responsável</p>
+                          <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.responsavel}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ) : null
+              ) : (
+                /* Tab de Notas — reutiliza o globalBoletim já carregado */
+                globalBoletim?.aluno?.nome === globalDetalhes?.aluno?.nome ? (
+                  globalBoletim.loading ? (
+                    <div className="py-16 flex flex-col items-center gap-4 text-slate-400">
+                      <Loader2 size={36} className="animate-spin text-orange-500" />
+                      <p className="text-[10px] font-black uppercase tracking-widest">Buscando notas em todas as unidades...</p>
+                    </div>
+                  ) : Object.keys(globalBoletim.resultados).length === 0 ? (
+                    <div className="py-16 flex flex-col items-center text-slate-400">
+                      <BookCheck size={36} className="opacity-20 mb-3" />
+                      <p className="text-[10px] font-black uppercase tracking-widest">Nenhuma nota encontrada</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-4">
+                      {/* Seletor de Ano */}
+                      {(() => {
+                        const todosAnosData = {};
+                        Object.entries(globalBoletim.resultados).forEach(([uKey, uData]) => {
+                          Object.keys(uData.anos).forEach(ano => {
+                            if (!todosAnosData[ano]) todosAnosData[ano] = [];
+                            todosAnosData[ano].push(uData.unidadeNome);
+                          });
+                        });
+                        const todosAnos = Object.keys(todosAnosData).sort((a, b) => b.localeCompare(a));
+                        return (
+                          <div className="space-y-4 border-b border-slate-100 pb-4">
+                            <div className="flex gap-2 flex-wrap">
+                              {todosAnos.map(ano => (
+                                <button key={ano} onClick={() => { setGlobalAnoBol(ano); setGlobalPeriodo('Todos'); }}
+                                  className={`px-4 py-2 rounded-xl transition-all border text-left ${globalAnoBol === ano ? 'bg-orange-600 border-orange-600 text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}>
+                                  <span className="font-black text-sm block leading-none">{ano}</span>
+                                </button>
+                              ))}
+                            </div>
+
+                            {/* Filtro de período */}
+                            {globalAnoBol && (() => {
+                              const todosPeriodos = new Set();
+                              Object.values(globalBoletim.resultados).forEach(u => {
+                                if (u.anos[globalAnoBol] && u.anos[globalAnoBol].disciplinas) {
+                                  u.anos[globalAnoBol].disciplinas.forEach(d => todosPeriodos.add(d.nome));
+                                }
+                              });
+                              const periodos = Array.from(todosPeriodos).sort();
+                              return periodos.length > 0 ? (
+                                <div className="flex gap-2 flex-wrap">
+                                  <button onClick={() => setGlobalPeriodo('Todos')} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === 'Todos' ? 'bg-orange-600 text-white shadow-md shadow-orange-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>Todos</button>
+                                  {periodos.map(p => (
+                                    <button key={p} onClick={() => setGlobalPeriodo(p)} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === p ? 'bg-orange-600 text-white shadow-md shadow-orange-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>{p}</button>
+                                  ))}
+                                </div>
+                              ) : null;
+                            })()}
+                          </div>
+                        );
+                      })()}
+                      {/* Disciplinas por unidade */}
+                      {globalAnoBol && Object.entries(globalBoletim.resultados).map(([uKey, uData]) => {
+                        if (!uData.anos[globalAnoBol]) return null;
+                        const { disciplinas, nomeTurma, temNotas } = uData.anos[globalAnoBol];
+                        const filtradas = disciplinas ? disciplinas.filter(d => globalPeriodo === 'Todos' || d.nome === globalPeriodo) : [];
+                        return (
+                          <div key={uKey} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                            <div className="bg-orange-50 border-b border-orange-100 p-3 px-5 flex items-center justify-between">
+                              <h4 className="font-black text-orange-900 uppercase tracking-widest text-xs flex items-center gap-2"><Building2 size={12} className="text-orange-500" />{uData.unidadeNome}</h4>
+                              {nomeTurma && <span className="text-[9px] font-black uppercase tracking-widest text-orange-400 bg-orange-50 border border-orange-100 px-2 py-1 rounded-lg">{nomeTurma}</span>}
+                            </div>
+                            {!temNotas || filtradas.length === 0 ? (
+                              <div className="p-8 text-center bg-white flex flex-col items-center">
+                                <BookCheck size={24} className="text-slate-200 mb-2" />
+                                <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Nenhuma nota lançada</p>
+                              </div>
+                            ) : (
+                              <div className="divide-y divide-slate-100 bg-white">
+                                {filtradas.map((d, i) => (
+                                  <div key={i} className="p-3 px-5 flex items-center justify-between hover:bg-slate-50">
+                                    <div className="flex flex-col gap-1">
+                                      <span className="text-xs font-bold text-slate-700 uppercase">
+                                        {d.disciplina}
+                                        <span className="font-normal ml-2 text-[9px] text-slate-400 tracking-widest">({d.nome})</span>
+                                      </span>
+                                      {d.subNotas && d.subNotas.length > 0 && (
+                                        <div className="flex gap-1.5 flex-wrap">
+                                          {d.subNotas.map((sn, idx) => (
+                                            <span key={idx} className="bg-orange-50 text-orange-600 font-bold text-[8px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-orange-100 flex items-center gap-1">
+                                              {sn.nome}: <span className="text-orange-900">{sn.nota}</span>
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                    <span className="font-black text-orange-600 w-14 text-center bg-orange-50 p-1.5 rounded-lg border border-orange-100 text-sm flex-shrink-0 self-start">{d.notaFinal}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                ) : (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Carregando notas...</p>
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* MODAL GLOBAL DE BOLETIM POR PESQUISA */}
-      {globalBoletim && (
+      {globalBoletim && !globalDetalhes && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => setGlobalBoletim(null)}>
           <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
             {/* Header */}
@@ -767,18 +1268,28 @@ const App = () => {
                 <div className="space-y-6">
                   {/* Seletor de Ano — todos os anos de todas as unidades */}
                   {(() => {
-                    const todosAnos = [...new Set(
-                      Object.values(globalBoletim.resultados).flatMap(u => Object.keys(u.anos))
-                    )].sort((a, b) => b.localeCompare(a));
+                    const todosAnosData = {};
+                    Object.entries(globalBoletim.resultados).forEach(([uKey, uData]) => {
+                      Object.keys(uData.anos).forEach(ano => {
+                        if (!todosAnosData[ano]) todosAnosData[ano] = [];
+                        todosAnosData[ano].push(uData.unidadeNome.replace('UNIDADE ', 'U').replace(' - ÍCONE', '').trim());
+                      });
+                    });
+
+                    const todosAnos = Object.keys(todosAnosData).sort((a, b) => b.localeCompare(a));
+
                     return (
                       <div className="flex gap-2 flex-wrap border-b border-slate-100 pb-4">
                         {todosAnos.map(ano => (
                           <button
                             key={ano}
                             onClick={() => { setGlobalAnoBol(ano); setGlobalPeriodo('Todos'); }}
-                            className={`px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest transition-all ${globalAnoBol === ano ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                            className={`px-5 py-2 rounded-xl transition-all border text-left ${globalAnoBol === ano ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
                           >
-                            {ano}
+                            <span className="font-black text-sm block leading-none mb-1">{ano}</span>
+                            <span className={`text-[8px] font-bold uppercase tracking-widest block ${globalAnoBol === ano ? 'text-indigo-200' : 'text-slate-400'}`}>
+                              {todosAnosData[ano].join(', ')}
+                            </span>
                           </button>
                         ))}
                       </div>
@@ -789,7 +1300,9 @@ const App = () => {
                   {globalAnoBol && (() => {
                     const todosPeriodos = new Set();
                     Object.values(globalBoletim.resultados).forEach(u => {
-                      if (u.anos[globalAnoBol]) u.anos[globalAnoBol].disciplinas.forEach(d => todosPeriodos.add(d.nome));
+                      if (u.anos[globalAnoBol] && u.anos[globalAnoBol].disciplinas) {
+                        u.anos[globalAnoBol].disciplinas.forEach(d => todosPeriodos.add(d.nome));
+                      }
                     });
                     const periodos = Array.from(todosPeriodos).sort();
                     return periodos.length > 0 ? (
@@ -805,9 +1318,9 @@ const App = () => {
                   {/* Resultados por unidade */}
                   {globalAnoBol && Object.entries(globalBoletim.resultados).map(([uKey, uData]) => {
                     if (!uData.anos[globalAnoBol]) return null;
-                    const { disciplinas, nomeTurma } = uData.anos[globalAnoBol];
-                    const filtradas = disciplinas.filter(d => globalPeriodo === 'Todos' || d.nome === globalPeriodo);
-                    if (filtradas.length === 0) return null;
+                    const { disciplinas, nomeTurma, temNotas } = uData.anos[globalAnoBol];
+                    const filtradas = disciplinas ? disciplinas.filter(d => globalPeriodo === 'Todos' || d.nome === globalPeriodo) : [];
+
                     return (
                       <div key={uKey} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
                         <div className="bg-gradient-to-r from-indigo-50 to-slate-50 border-b border-slate-200 p-3 px-5 flex items-center justify-between">
@@ -820,28 +1333,36 @@ const App = () => {
                             </span>
                           )}
                         </div>
-                        <div className="divide-y divide-slate-100">
-                          {filtradas.map((d, i) => (
-                            <div key={i} className="p-3 px-5 flex items-center justify-between hover:bg-slate-50 transition-colors">
-                              <span className="text-xs font-bold text-slate-700 uppercase">
-                                {d.disciplina}
-                                <span className="font-normal ml-2 text-[9px] text-slate-400 tracking-widest">({d.nome})</span>
-                              </span>
-                              <div className="flex flex-col items-end gap-1">
-                                <span className="font-black text-indigo-600 w-14 text-center bg-indigo-50 p-1.5 rounded-lg border border-indigo-100 text-sm">{d.notaFinal}</span>
-                                {d.subNotas && d.subNotas.length > 0 && (
-                                  <div className="flex gap-1.5 flex-wrap justify-end">
-                                    {d.subNotas.map((sn, idx) => (
-                                      <span key={idx} className="bg-slate-100 text-slate-500 font-bold text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-slate-200">
-                                        {sn.nome}: <span className="text-slate-700">{sn.nota}</span>
-                                      </span>
-                                    ))}
-                                  </div>
-                                )}
+
+                        {!temNotas || filtradas.length === 0 ? (
+                          <div className="p-8 text-center bg-white flex flex-col items-center">
+                            <BookCheck size={24} className="text-slate-200 mb-2" />
+                            <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Nenhuma nota lançada neste período</p>
+                          </div>
+                        ) : (
+                          <div className="divide-y divide-slate-100 bg-white">
+                            {filtradas.map((d, i) => (
+                              <div key={i} className="p-3 px-5 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                                <span className="text-xs font-bold text-slate-700 uppercase">
+                                  {d.disciplina}
+                                  <span className="font-normal ml-2 text-[9px] text-slate-400 tracking-widest">({d.nome})</span>
+                                </span>
+                                <div className="flex flex-col items-end gap-1">
+                                  <span className="font-black text-indigo-600 w-14 text-center bg-indigo-50 p-1.5 rounded-lg border border-indigo-100 text-sm">{d.notaFinal}</span>
+                                  {d.subNotas && d.subNotas.length > 0 && (
+                                    <div className="flex gap-1.5 flex-wrap justify-end">
+                                      {d.subNotas.map((sn, idx) => (
+                                        <span key={idx} className="bg-slate-100 text-slate-500 font-bold text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-slate-200">
+                                          {sn.nome}: <span className="text-slate-700">{sn.nota}</span>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            </div>
-                          ))}
-                        </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -1170,401 +1691,624 @@ const App = () => {
         </div>
       )}
 
-      <div className="max-w-6xl mx-auto space-y-8">
-        {/* TABS DE NAVEGAÇÃO */}
-        <div className="flex bg-white/50 backdrop-blur border border-slate-200 p-1.5 rounded-2xl w-fit mx-auto shadow-sm">
-          <button
-            onClick={() => { setViewMode('auditoria'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
-            className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'auditoria' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-500 hover:text-orange-600 hover:bg-slate-100'}`}
-          >
-            <BookCheck size={16} /> Auditoria Material
-          </button>
-          <button
-            onClick={() => { setViewMode('notas'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
-            className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'notas' ? 'bg-indigo-600 text-white shadow-md shadow-indigo-600/20' : 'text-slate-500 hover:text-indigo-600 hover:bg-slate-100'}`}
-          >
-            <GraduationCap size={16} /> Boletim Alunos
-          </button>
-        </div>
-
-        <div className="bg-slate-900 rounded-[2rem] shadow-2xl relative overflow-hidden group">
-          {/* Efeito Glass decorativo */}
-          <div className={`absolute top-0 right-0 w-[500px] h-[500px] bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 pointer-events-none transition-colors duration-700 ${viewMode === 'notas' ? 'group-hover:bg-indigo-500/10' : 'group-hover:bg-orange-500/10'}`}></div>
-
-          <div className="p-8 md:p-12 text-white relative z-10">
-            <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-8">
-              <div className="flex items-center gap-6">
-                <div className="p-5 bg-white/10 rounded-2xl backdrop-blur-md border border-white/10 shadow-inner">
-                  {viewMode === 'auditoria' ? <BookCheck size={40} className="text-orange-400" /> : <GraduationCap size={40} className="text-indigo-400" />}
-                </div>
-                <div>
-                  <h1 className="text-3xl font-black uppercase tracking-tight leading-none mb-2">
-                    {viewMode === 'auditoria' ? 'Auditoria Material 2026' : 'Histórico Acadêmico 2026'}
-                  </h1>
-                  <div className="flex items-center gap-2">
-                    <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${viewMode === 'auditoria' ? 'bg-orange-500' : 'bg-indigo-500'}`}></span>
-                    <p className="text-slate-400 text-xs font-bold uppercase tracking-[0.2em]">
-                      {viewMode === 'auditoria' ? 'Verificação Financeira Individual (Pente-Fino)' : 'Consulta de Veteranos e Boletins Passados'}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="bg-slate-800/80 p-1.5 pl-5 rounded-2xl flex flex-col gap-1 backdrop-blur-sm border border-white/5 min-w-[300px] shadow-xl">
-                <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1.5 mt-2">
-                  <Building2 size={10} /> Unidade Selecionada
-                </label>
-                <div className="relative group/select">
-                  <select
-                    className="w-full bg-transparent text-white font-bold text-sm uppercase appearance-none outline-none py-3 pr-8 cursor-pointer group-hover/select:text-orange-400 transition-colors"
-                    value={selectedUnidade}
-                    onChange={(e) => {
-                      setSelectedUnidade(e.target.value);
-                      setTurmas([]);
-                      setSelectedTurmaId(null);
-                    }}
-                  >
-                    {Object.entries(UNIDADES_CONFIG).map(([key, config]) => (
-                      <option key={key} value={key} className="bg-slate-900 text-white">{config.nome}</option>
-                    ))}
-                  </select>
-                  <ChevronDown size={16} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500 group-hover/select:text-orange-500 transition-colors" />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-white py-4 px-8 md:px-12 flex flex-col md:flex-row justify-between items-center gap-4">
-            <div className="flex items-center gap-3">
-              <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)] animate-pulse"></div>
-              <span className="text-[11px] font-black uppercase tracking-widest text-slate-400">Sistema Conectado e Pronto</span>
-            </div>
+      <div className="max-w-[1400px] mx-auto flex flex-col lg:flex-row gap-8 items-start">
+        <div className="flex-1 space-y-8 w-full min-w-0">
+          {/* TABS DE NAVEGAÇÃO */}
+          <div className="flex bg-white/50 backdrop-blur border border-slate-200 p-1.5 rounded-2xl w-fit mx-auto shadow-sm">
             <button
-              onClick={fetchTurmas}
-              disabled={loadingTurmas}
-              className={`w-full md:w-auto text-white px-8 py-4 rounded-xl font-black transition-all flex items-center justify-center gap-3 shadow-lg hover:-translate-y-0.5 active:translate-y-0 uppercase text-[11px] tracking-widest disabled:opacity-50 disabled:pointer-events-none ${viewMode === 'auditoria' ? 'bg-orange-600 hover:bg-orange-500 shadow-orange-600/20 hover:shadow-orange-600/40' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/20 hover:shadow-indigo-600/40'}`}
+              onClick={() => { setViewMode('auditoria'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
+              className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'auditoria' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-500 hover:text-orange-600 hover:bg-slate-100'}`}
             >
-              {loadingTurmas ? <Loader2 className="animate-spin" size={16} /> : <><Play size={16} fill="currentColor" /> Carregar Turmas 2026</>}
+              <BookCheck size={16} /> Auditoria Material
+            </button>
+            <button
+              onClick={() => { setViewMode('notas'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
+              className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'notas' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-500 hover:text-orange-600 hover:bg-slate-100'}`}
+            >
+              <GraduationCap size={16} /> Consulta de Dados
             </button>
           </div>
-        </div>
 
-        {error && (
-          <div className="bg-red-50 border-l-4 border-red-500 text-red-600 p-6 rounded-2xl flex items-center gap-4 shadow-sm animate-in slide-in-from-top-4">
-            <AlertCircle className="shrink-0" size={24} />
-            <p className="font-bold text-sm">{error}</p>
-          </div>
-        )}
-
-        {/* BARRA DE PESQUISA GLOBAL — Notas Mode */}
-        {viewMode === 'notas' && (
-          <div className="relative">
-            <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 flex items-center gap-3">
-              <div className="flex items-center gap-3 flex-1 px-4 py-3">
-                {globalSearchLoading
-                  ? <Loader2 size={18} className="text-indigo-400 animate-spin flex-shrink-0" />
-                  : <Globe size={18} className="text-indigo-400 flex-shrink-0" />
-                }
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  placeholder="Pesquisar aluno em todas as unidades..."
-                  value={globalSearch}
-                  onChange={e => {
-                    const val = e.target.value;
-                    setGlobalSearch(val);
-                    setGlobalSearchOpen(true);
-                    clearTimeout(searchDebounceRef.current);
-                    searchDebounceRef.current = setTimeout(() => runGlobalSearch(val), 400);
-                  }}
-                  onFocus={() => { if (globalSearchResults.length > 0) setGlobalSearchOpen(true); }}
-                  className="flex-1 bg-transparent text-slate-800 font-bold text-sm placeholder:text-slate-400 outline-none"
-                />
-                {globalSearch && (
-                  <button onClick={() => { setGlobalSearch(''); setGlobalSearchResults([]); setGlobalSearchOpen(false); setGlobalBoletim(null); }} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors">
-                    <XCircle size={16} />
-                  </button>
-                )}
+          {viewMode === 'welcome' && (
+            <div className="bg-white rounded-[2rem] shadow-sm border border-slate-200 p-12 text-center flex flex-col items-center justify-center min-h-[50vh] animate-in fade-in zoom-in-95 duration-500">
+              <div className="w-24 h-24 bg-orange-50 rounded-full flex items-center justify-center mb-6">
+                <School size={48} className="text-orange-500" />
               </div>
-              <div className="h-8 w-px bg-slate-200 flex-shrink-0" />
-              <div className="px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-400 flex-shrink-0">
-                {globalSearchResults.length > 0 ? `${globalSearchResults.length} resultado${globalSearchResults.length !== 1 ? 's' : ''}` : 'Pesquisa Global'}
-              </div>
+              <h1 className="text-3xl font-black text-slate-800 uppercase tracking-tight mb-4">Bem-vindo ao Sistema</h1>
+              <p className="text-slate-500 max-w-md font-medium text-sm">
+                Selecione uma das guias acima para iniciar. Você pode realizar a Auditoria de Material ou consultar o Histórico de Notas dos alunos.
+              </p>
             </div>
+          )}
 
-            {/* Dropdown de autocompletamento */}
-            {globalSearchOpen && globalSearchResults.length > 0 && (
-              <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-2xl border border-slate-200 z-40 overflow-hidden max-h-72 overflow-y-auto">
-                {globalSearchResults.map((result, idx) => (
-                  <button
-                    key={`${result.unidadeKey}-${result.id}`}
-                    onClick={() => fetchGlobalBoletim(result)}
-                    className="w-full text-left px-5 py-3.5 hover:bg-indigo-50 transition-colors flex items-center justify-between border-b border-slate-100 last:border-0 group"
-                  >
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center font-black text-sm flex-shrink-0">
-                        {result.nome.charAt(0)}
+          {viewMode !== 'welcome' && (
+            <>
+              <div className="bg-slate-900 rounded-[2rem] shadow-2xl relative overflow-hidden group animate-in fade-in duration-300">
+                {/* Efeito Glass decorativo */}
+                <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 pointer-events-none transition-colors duration-700 group-hover:bg-orange-500/10"></div>
+
+                <div className="p-8 md:p-12 text-white relative z-10">
+                  <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-8">
+                    <div className="flex items-center gap-6">
+                      <div className="p-5 bg-white/10 rounded-2xl backdrop-blur-md border border-white/10 shadow-inner">
+                        {viewMode === 'auditoria' ? <BookCheck size={40} className="text-orange-400" /> : <GraduationCap size={40} className="text-orange-400" />}
                       </div>
                       <div>
-                        <p className="font-bold text-sm text-slate-800 group-hover:text-indigo-900">{result.nome}</p>
-                        <p className="text-[9px] font-black uppercase tracking-widest text-indigo-400 mt-0.5">{result.unidadeNome}</p>
+                        <h1 className="text-3xl font-black uppercase tracking-tight leading-none mb-2">
+                          {viewMode === 'auditoria' ? 'Auditoria Material 2026' : 'Histórico Acadêmico 2026'}
+                        </h1>
+                        <div className="flex items-center gap-2">
+                          <span className="w-1.5 h-1.5 rounded-full animate-pulse bg-orange-500"></span>
+                          <p className="text-slate-400 text-xs font-bold uppercase tracking-[0.2em]">
+                            {viewMode === 'auditoria' ? 'Verificação Financeira Individual (Pente-Fino)' : 'Consulta de Veteranos e Boletins Passados'}
+                          </p>
+                        </div>
                       </div>
                     </div>
-                    <span className="text-[9px] font-black uppercase tracking-widest text-slate-300 group-hover:text-indigo-400 transition-colors px-2 py-1 bg-slate-100 group-hover:bg-indigo-100 rounded-lg">
-                      Ver Notas →
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
 
-            {/* Dropdown vazio (sem resultados) */}
-            {globalSearchOpen && !globalSearchLoading && globalSearch.trim().length >= 3 && globalSearchResults.length === 0 && (
-              <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-slate-200 z-40 px-5 py-6 text-center">
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno encontrado com esse nome</p>
-              </div>
-            )}
-          </div>
-        )}
-
-
-        {/* Lista de Turmas */}
-        <div className="space-y-4 pb-20">
-          {turmas.map((turma) => (
-            <div key={turma.id} className={`bg-white rounded-[2rem] shadow-sm border transaction-all duration-300 overflow-hidden ${selectedTurmaId === turma.id ? 'ring-2 ring-orange-500 border-transparent shadow-xl shadow-orange-100' : 'border-slate-200 hover:border-orange-200 hover:shadow-md'}`}>
-              <div
-                onClick={() => fetchAlunosEMateriais(turma.id)}
-                className="w-full cursor-pointer text-left p-6 md:p-8 flex items-center justify-between group transition-colors"
-              >
-                <div className="flex items-center gap-6">
-                  <div className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? (viewMode === 'auditoria' ? 'bg-orange-600 text-white shadow-lg shadow-orange-300' : 'bg-indigo-600 text-white shadow-lg shadow-indigo-300') : `bg-slate-100 text-slate-400 ${viewMode === 'auditoria' ? 'group-hover:bg-orange-50 group-hover:text-orange-500' : 'group-hover:bg-indigo-50 group-hover:text-indigo-500'}`}`}>
-                    <LayoutList size={24} />
-                  </div>
-                  <div>
-                    <h3 className={`font-black text-slate-800 uppercase tracking-tight text-xl transition-colors ${viewMode === 'auditoria' ? 'group-hover:text-orange-600' : 'group-hover:text-indigo-600'}`}>
-                      {turma.nome} <span className="text-slate-300 font-medium ml-2">- 2026</span>
-                    </h3>
-                    <div className="flex items-center gap-3 mt-1.5">
-                      <span className={`text-[10px] font-black text-slate-500 uppercase tracking-widest bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 transition-colors ${viewMode === 'auditoria' ? 'group-hover:border-orange-200 group-hover:bg-orange-50 group-hover:text-orange-600' : 'group-hover:border-indigo-200 group-hover:bg-indigo-50 group-hover:text-indigo-600'}`}>
-                        {turma.sigla}
-                      </span>
-                      <span className={`text-[10px] font-black text-white px-2.5 py-1 rounded-md uppercase tracking-widest shadow-sm ${viewMode === 'auditoria' ? 'bg-orange-500 shadow-orange-200' : 'bg-indigo-500 shadow-indigo-200'}`}>
-                        {turma.vagasOcupadas} Alunos
-                      </span>
+                    <div className="bg-slate-800/80 p-1.5 pl-5 rounded-2xl flex flex-col gap-1 backdrop-blur-sm border border-white/5 min-w-[300px] shadow-xl">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1.5 mt-2">
+                        <Building2 size={10} /> Unidade Selecionada
+                      </label>
+                      <div className="relative group/select">
+                        <select
+                          className="w-full bg-transparent text-white font-bold text-sm uppercase appearance-none outline-none py-3 pr-8 cursor-pointer group-hover/select:text-orange-400 transition-colors"
+                          value={selectedUnidade}
+                          onChange={(e) => {
+                            setSelectedUnidade(e.target.value);
+                            setTurmas([]);
+                            setSelectedTurmaId(null);
+                          }}
+                        >
+                          {Object.entries(UNIDADES_CONFIG).map(([key, config]) => (
+                            <option key={key} value={key} className="bg-slate-900 text-white">{config.nome}</option>
+                          ))}
+                        </select>
+                        <ChevronDown size={16} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500 group-hover/select:text-orange-500 transition-colors" />
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3">
+                <div className="bg-white py-4 px-8 md:px-12 flex flex-col md:flex-row justify-between items-center gap-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)] animate-pulse"></div>
+                    <span className="text-[11px] font-black uppercase tracking-widest text-slate-400">Sistema Conectado e Pronto</span>
+                  </div>
                   <button
-                    onClick={(e) => handleDownloadReport(turma, e)}
-                    disabled={downloadingTurmaId === turma.id}
-                    className={`w-10 h-10 rounded-full flex items-center justify-center transition-all border ${downloadingTurmaId === turma.id ? 'bg-orange-100 border-orange-200 text-orange-600 animate-pulse cursor-wait' : 'bg-white border-slate-200 text-slate-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50 hover:shadow-sm'}`}
-                    title="Baixar Planilha da Turma"
+                    onClick={fetchTurmas}
+                    disabled={loadingTurmas}
+                    className="w-full md:w-auto text-white px-8 py-4 rounded-xl font-black transition-all flex items-center justify-center gap-3 shadow-lg hover:-translate-y-0.5 active:translate-y-0 uppercase text-[11px] tracking-widest disabled:opacity-50 disabled:pointer-events-none bg-orange-600 hover:bg-orange-500 shadow-orange-600/20 hover:shadow-orange-600/40"
                   >
-                    {downloadingTurmaId === turma.id ? <Loader2 size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
+                    {loadingTurmas ? <Loader2 className="animate-spin" size={16} /> : <><Play size={16} fill="currentColor" /> Carregar Turmas 2026</>}
                   </button>
-
-                  <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-100/50 rotate-180' : 'bg-slate-50 group-hover:bg-orange-50'}`}>
-                    <ChevronDown className={`transition-colors ${selectedTurmaId === turma.id ? 'text-orange-600' : 'text-slate-400 group-hover:text-orange-500'}`} />
-                  </div>
                 </div>
               </div>
 
-              {selectedTurmaId === turma.id && (
-                <div className="border-t border-slate-100 bg-slate-50/50 animate-in slide-in-from-top-2 duration-300">
+              {error && (
+                <div className="bg-red-50 border-l-4 border-red-500 text-red-600 p-6 rounded-2xl flex items-center gap-4 shadow-sm animate-in slide-in-from-top-4">
+                  <AlertCircle className="shrink-0" size={24} />
+                  <p className="font-bold text-sm">{error}</p>
+                </div>
+              )}
 
-                  {/* Barra de Progresso da Turma */}
-                  {loadingAlunos && (
-                    <div className="p-8 pb-0">
-                      <div className="bg-white rounded-2xl p-6 border border-orange-100 shadow-sm flex items-center gap-5">
-                        <div className="p-3 bg-orange-50 rounded-xl relative">
-                          <Loader2 className="animate-spin text-orange-500" size={24} />
-                        </div>
-                        <div className="flex-1 space-y-2">
-                          <div className="flex justify-between text-[11px] font-black uppercase tracking-widest text-slate-400">
-                            <span className="text-orange-600">Cruzando Dados Financeiros</span>
-                            <span>{Math.round((progressAluno.current / Math.max(progressAluno.total, 1)) * 100)}%</span>
+              {/* BARRA DE PESQUISA GLOBAL — Notas Mode */}
+              {viewMode === 'notas' && (
+                <div className="relative">
+                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 flex items-center gap-3">
+                    <div className="flex items-center gap-3 flex-1 px-4 py-3">
+                      {globalSearchLoading
+                        ? <Loader2 size={18} className="text-indigo-400 animate-spin flex-shrink-0" />
+                        : <Globe size={18} className="text-indigo-400 flex-shrink-0" />
+                      }
+                      <input
+                        ref={searchInputRef}
+                        type="text"
+                        placeholder="Pesquisar aluno em todas as unidades..."
+                        value={globalSearch}
+                        onChange={e => {
+                          const val = e.target.value;
+                          setGlobalSearch(val);
+                          setGlobalSearchOpen(true);
+                          clearTimeout(searchDebounceRef.current);
+                          searchDebounceRef.current = setTimeout(() => runGlobalSearch(val), 400);
+                        }}
+                        onFocus={() => { if (globalSearchResults.length > 0) setGlobalSearchOpen(true); }}
+                        className="flex-1 bg-transparent text-slate-800 font-bold text-sm placeholder:text-slate-400 outline-none"
+                      />
+                      {globalSearch && (
+                        <button onClick={() => { setGlobalSearch(''); setGlobalSearchResults([]); setGlobalSearchOpen(false); setGlobalBoletim(null); }} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors">
+                          <XCircle size={16} />
+                        </button>
+                      )}
+                    </div>
+                    <div className="h-8 w-px bg-slate-200 flex-shrink-0" />
+                    <div className="px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-400 flex-shrink-0">
+                      {globalSearchResults.length > 0 ? `${globalSearchResults.length} resultado${globalSearchResults.length !== 1 ? 's' : ''}` : 'Pesquisa Global'}
+                    </div>
+                  </div>
+
+                  {/* Dropdown de autocompletamento */}
+                  {globalSearchOpen && globalSearchResults.length > 0 && (
+                    <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-2xl border border-slate-200 z-40 overflow-hidden max-h-72 overflow-y-auto">
+                      {globalSearchResults.map((result) => (
+                        <div
+                          key={`${result.unidadeKey}-${result.id}`}
+                          className="w-full text-left px-4 sm:px-5 py-3.5 hover:bg-indigo-50 transition-colors flex items-center justify-between border-b border-slate-100 last:border-0 group"
+                        >
+                          <button onClick={() => fetchGlobalDetalhes(result)} className="flex-1 flex items-center gap-3 text-left overflow-hidden">
+                            <div className="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center font-black text-sm flex-shrink-0">
+                              {result.nome.charAt(0)}
+                            </div>
+                            <div className="min-w-0 pr-2">
+                              <p className="font-bold text-sm text-slate-800 group-hover:text-indigo-900 truncate">{result.nome}</p>
+                              {result.unidades && result.unidades.length > 0 ? (
+                                <div className="flex flex-wrap gap-1 mt-1">
+                                  {result.unidades.map(u => (
+                                    <span key={u.unidadeKey} className="text-[9px] font-black uppercase tracking-widest text-indigo-400 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 whitespace-nowrap truncate max-w-full">{u.unidadeNome}</span>
+                                  ))}
+                                </div>
+                              ) : (
+                                <p className="text-[9px] font-black uppercase tracking-widest text-indigo-400 mt-0.5 truncate">{result.unidadeNome}</p>
+                              )}
+                            </div>
+                          </button>
+
+                          <div className="flex items-center gap-1.5 sm:gap-3 pl-2 sm:pl-4 border-l border-slate-100 ml-1">
+                            <button onClick={() => fetchGlobalDetalhes(result)} className="hidden sm:block text-[9px] font-black uppercase tracking-widest text-slate-300 group-hover:text-orange-400 transition-colors px-2 py-1.5 bg-slate-100 group-hover:bg-orange-100 rounded-lg whitespace-nowrap">
+                              Ver Dados
+                            </button>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (savedStudents.find(s => s.nome === result.nome)) {
+                                  setSavedStudents(prev => prev.filter(s => s.nome !== result.nome));
+                                } else {
+                                  setSavedStudents(prev => [...prev, result]);
+                                }
+                              }}
+                              className={`${savedStudents.find(s => s.nome === result.nome) ? 'text-green-500 bg-green-50 hover:bg-red-50 hover:text-red-500' : 'text-slate-400 hover:text-white bg-slate-100 hover:bg-green-500'} p-2 rounded-xl transition-all shadow-sm flex-shrink-0 group/action`}
+                              title={savedStudents.find(s => s.nome === result.nome) ? "Remover dos Alunos Salvos" : "Salvar Aluno para Exportar"}
+                            >
+                              {savedStudents.find(s => s.nome === result.nome)
+                                ? <><CheckCircle size={18} strokeWidth={2.5} className="group-hover/action:hidden" /><XCircle size={18} strokeWidth={2.5} className="hidden group-hover/action:block" /></>
+                                : <Plus size={18} strokeWidth={2.5} />}
+                            </button>
                           </div>
-                          <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                            <div
-                              className="h-full bg-gradient-to-r from-orange-500 to-orange-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(249,115,22,0.5)]"
-                              style={{ width: `${(progressAluno.current / Math.max(progressAluno.total, 1)) * 100}%` }}
-                            />
-                          </div>
                         </div>
-                      </div>
+                      ))}
                     </div>
                   )}
 
-                  <div className="p-8">
-                    <div className="flex justify-between items-center mb-6">
-                      <h4 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em] flex items-center gap-2">
-                        <Users size={14} /> Lista de Alunos
-                      </h4>
-                      <button
-                        onClick={() => viewMode === 'auditoria' ? setFiltroCompradores(!filtroCompradores) : setFiltroVeteranos(!filtroVeteranos)}
-                        className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm ${(viewMode === 'auditoria' && filtroCompradores) || (viewMode === 'notas' && filtroVeteranos)
-                          ? 'bg-slate-800 text-white shadow-slate-800/20 ring-2 ring-slate-800 ring-offset-2 ring-offset-slate-50'
-                          : `bg-white border border-slate-200 text-slate-500 hover:bg-white ${viewMode === 'auditoria' ? 'hover:text-orange-600 hover:border-orange-200' : 'hover:text-indigo-600 hover:border-indigo-200'}`
-                          }`}
-                      >
-                        <Filter size={12} />
-                        {viewMode === 'auditoria'
-                          ? (filtroCompradores ? 'Mostrando: Apenas Compradores' : 'Filtrar Compradores')
-                          : (filtroVeteranos ? 'Mostrando: Apenas Veteranos' : 'Filtrar Veteranos')}
-                      </button>
+                  {/* Dropdown vazio (sem resultados) */}
+                  {globalSearchOpen && !globalSearchLoading && globalSearch.trim().length >= 3 && globalSearchResults.length === 0 && (
+                    <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-slate-200 z-40 px-5 py-6 text-center">
+                      <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno encontrado com esse nome</p>
+                    </div>
+                  )}
+                </div>
+              )}
+
+
+              {/* Lista de Turmas */}
+              <div className="space-y-4 pb-20">
+                {turmas.map((turma) => (
+                  <div key={turma.id} className={`bg-white rounded-[2rem] shadow-sm border transaction-all duration-300 overflow-hidden ${selectedTurmaId === turma.id ? 'ring-2 ring-orange-500 border-transparent shadow-xl shadow-orange-100' : 'border-slate-200 hover:border-orange-200 hover:shadow-md'}`}>
+                    <div
+                      onClick={() => fetchAlunosEMateriais(turma.id)}
+                      className="w-full cursor-pointer text-left p-6 md:p-8 flex items-center justify-between group transition-colors"
+                    >
+                      <div className="flex items-center gap-6">
+                        <div className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-600 text-white shadow-lg shadow-orange-300' : 'bg-slate-100 text-slate-400 group-hover:bg-orange-50 group-hover:text-orange-500'}`}>
+                          <LayoutList size={24} />
+                        </div>
+                        <div>
+                          <h3 className="font-black text-slate-800 uppercase tracking-tight text-xl transition-colors group-hover:text-orange-600">
+                            {turma.nome} <span className="text-slate-300 font-medium ml-2">- 2026</span>
+                          </h3>
+                          <div className="flex items-center gap-3 mt-1.5">
+                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 transition-colors group-hover:border-orange-200 group-hover:bg-orange-50 group-hover:text-orange-600">
+                              {turma.sigla}
+                            </span>
+                            <span className="text-[10px] font-black text-white px-2.5 py-1 rounded-md uppercase tracking-widest shadow-sm bg-orange-500 shadow-orange-200">
+                              {turma.vagasOcupadas} Alunos
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={(e) => handleDownloadReport(turma, e)}
+                          disabled={downloadingTurmaId === turma.id}
+                          className={`w-10 h-10 rounded-full flex items-center justify-center transition-all border ${downloadingTurmaId === turma.id ? 'bg-orange-100 border-orange-200 text-orange-600 animate-pulse cursor-wait' : 'bg-white border-slate-200 text-slate-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50 hover:shadow-sm'}`}
+                          title="Baixar Planilha da Turma"
+                        >
+                          {downloadingTurmaId === turma.id ? <Loader2 size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
+                        </button>
+
+                        <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-100/50 rotate-180' : 'bg-slate-50 group-hover:bg-orange-50'}`}>
+                          <ChevronDown className={`transition-colors ${selectedTurmaId === turma.id ? 'text-orange-600' : 'text-slate-400 group-hover:text-orange-500'}`} />
+                        </div>
+                      </div>
                     </div>
 
-                    <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-                      {alunosExibidos.length > 0 ? (
-                        <div className="divide-y divide-slate-100">
-                          {alunosExibidos.map((aluno) => (
-                            <div key={aluno.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition-colors group">
-                              <div className="flex items-center gap-4">
-                                <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs shadow-sm transition-colors ${aluno.material.comprou
-                                  ? 'bg-green-100 text-green-700 shadow-green-100'
-                                  : 'bg-slate-100 text-slate-400 group-hover:bg-white group-hover:shadow-sm group-hover:text-slate-500'
-                                  }`}>
-                                  {aluno.nome.charAt(0)}
-                                </div>
-                                <div>
-                                  <p className={`font-bold text-sm uppercase tracking-tight ${aluno.material.comprou ? 'text-slate-800' : 'text-slate-500'}`}>{aluno.nome}</p>
-                                  <p className="font-mono text-[10px] text-slate-400">ID: <span className="font-bold">{aluno.id}</span></p>
-                                </div>
+                    {selectedTurmaId === turma.id && (
+                      <div className="border-t border-slate-100 bg-slate-50/50 animate-in slide-in-from-top-2 duration-300">
+
+                        {/* Barra de Progresso da Turma */}
+                        {loadingAlunos && (
+                          <div className="p-8 pb-0">
+                            <div className="bg-white rounded-2xl p-6 border border-orange-100 shadow-sm flex items-center gap-5">
+                              <div className="p-3 bg-orange-50 rounded-xl relative">
+                                <Loader2 className="animate-spin text-orange-500" size={24} />
                               </div>
-
-                              <div className="flex items-center gap-6">
-                                {/* Info Secundária */}
-                                {viewMode === 'auditoria' ? (
-                                  <>
-                                    {/* Status Material */}
-                                    {aluno.material.loading ? (
-                                      <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
-                                    ) : (
-                                      <div className={`px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border flex items-center gap-1.5 min-w-[140px] justify-center ${aluno.material.comprou
-                                        ? 'bg-blue-50 border-blue-100 text-blue-600'
-                                        : 'bg-slate-50 border-slate-100 text-slate-300'
-                                        }`}>
-                                        {aluno.material.comprou ? (
-                                          <><BookCheck size={12} /> {aluno.material.det.substring(0, 15)}...</>
-                                        ) : (
-                                          <><XCircle size={12} /> Não Identificado</>
-                                        )}
-                                      </div>
-                                    )}
-
-                                    {/* Status Pagamento */}
-                                    <div className="w-28 text-right">
-                                      {aluno.material.loading ? (
-                                        <div className="w-16 h-4 bg-slate-100 rounded animate-pulse ml-auto" />
-                                      ) : aluno.material.comprou ? (
-                                        aluno.material.pago ? (
-                                          <div className="inline-flex items-center gap-1.5 text-green-600 font-black text-[10px] uppercase tracking-widest bg-green-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-green-600/20">
-                                            <CheckCircle size={12} /> Pago
-                                          </div>
-                                        ) : (
-                                          <div className="inline-flex items-center gap-1.5 text-orange-600 font-black text-[10px] uppercase tracking-widest bg-orange-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-orange-600/20 animate-pulse">
-                                            <DollarSign size={12} /> Pendente
-                                          </div>
-                                        )
-                                      ) : (
-                                        <span className="text-slate-200 font-bold text-xl">-</span>
-                                      )}
-                                    </div>
-                                  </>
-                                ) : (
-                                  <>
-                                    {/* Status Veterano */}
-                                    {aluno.material.loading ? (
-                                      <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
-                                    ) : aluno.material.anosAnteriores?.length > 0 ? (
-                                      <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-indigo-50 border-indigo-100 text-indigo-600 flex items-center gap-1.5 min-w-[140px] justify-center">
-                                        <GraduationCap size={12} /> Veterano ({aluno.material.anosAnteriores.map(a => a.ano).join(', ')})
-                                      </div>
-                                    ) : (
-                                      <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-slate-50 border-slate-100 text-slate-400 flex items-center gap-1.5 min-w-[140px] justify-center">
-                                        <User size={12} /> Novato (Só 2026)
-                                      </div>
-                                    )}
-
-                                    {/* Botão Ver Notas */}
-                                    <div className="w-28 text-right">
-                                      {!aluno.material.loading && aluno.material.anosAnteriores?.length > 0 && (
-                                        <button
-                                          onClick={(e) => { e.stopPropagation(); fetchBoletimAluno(aluno); }}
-                                          className="inline-flex items-center gap-1.5 text-indigo-600 font-black text-[10px] uppercase tracking-widest bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-200 hover:bg-indigo-600 hover:text-white transition-colors"
-                                        >
-                                          <BookCheck size={12} /> Ver Notas
-                                        </button>
-                                      )}
-                                    </div>
-                                  </>
-                                )}
-
-                                {/* Botão Mais Opções */}
-                                <button
-                                  onClick={(e) => { e.stopPropagation(); fetchDetalhesAluno(aluno); }}
-                                  className="w-8 h-8 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-orange-500 transition-colors"
-                                >
-                                  <div className="flex gap-0.5">
-                                    <div className="w-1 h-1 bg-current rounded-full"></div>
-                                    <div className="w-1 h-1 bg-current rounded-full"></div>
-                                    <div className="w-1 h-1 bg-current rounded-full"></div>
-                                  </div>
-                                </button>
+                              <div className="flex-1 space-y-2">
+                                <div className="flex justify-between text-[11px] font-black uppercase tracking-widest text-slate-400">
+                                  <span className="text-orange-600">{viewMode === 'notas' ? 'Buscando Histórico de Notas' : 'Cruzando Dados Financeiros'}</span>
+                                  <span>{Math.round((progressAluno.current / Math.max(progressAluno.total, 1)) * 100)}%</span>
+                                </div>
+                                <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-orange-500 to-orange-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(249,115,22,0.5)]"
+                                    style={{ width: `${(progressAluno.current / Math.max(progressAluno.total, 1)) * 100}%` }}
+                                  />
+                                </div>
                               </div>
                             </div>
+                          </div>
+                        )}
+
+                        <div className="p-8">
+                          <div className="flex justify-between items-center mb-6">
+                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em] flex items-center gap-2">
+                              <Users size={14} /> Lista de Alunos
+                            </h4>
+                            <button
+                              onClick={() => viewMode === 'auditoria' ? setFiltroCompradores(!filtroCompradores) : setFiltroVeteranos(!filtroVeteranos)}
+                              className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm ${(viewMode === 'auditoria' && filtroCompradores) || (viewMode === 'notas' && filtroVeteranos)
+                                ? 'bg-slate-800 text-white shadow-slate-800/20 ring-2 ring-slate-800 ring-offset-2 ring-offset-slate-50'
+                                : 'bg-white border border-slate-200 text-slate-500 hover:bg-white hover:text-orange-600 hover:border-orange-200'
+                                }`}
+                            >
+                              <Filter size={12} />
+                              {viewMode === 'auditoria'
+                                ? (filtroCompradores ? 'Mostrando: Apenas Compradores' : 'Filtrar Compradores')
+                                : (filtroVeteranos ? 'Mostrando: Apenas Veteranos' : 'Filtrar Veteranos')}
+                            </button>
+                          </div>
+
+                          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                            {alunosExibidos.length > 0 ? (
+                              <div className="divide-y divide-slate-100">
+                                {alunosExibidos.map((aluno) => (
+                                  <div key={aluno.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition-colors group">
+                                    <div className="flex items-center gap-4">
+                                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs shadow-sm transition-colors ${aluno.material.comprou
+                                        ? 'bg-green-100 text-green-700 shadow-green-100'
+                                        : 'bg-slate-100 text-slate-400 group-hover:bg-white group-hover:shadow-sm group-hover:text-slate-500'
+                                        }`}>
+                                        {aluno.nome.charAt(0)}
+                                      </div>
+                                      <div>
+                                        <p className={`font-bold text-sm uppercase tracking-tight ${aluno.material.comprou ? 'text-slate-800' : 'text-slate-500'}`}>{aluno.nome}</p>
+                                        <p className="font-mono text-[10px] text-slate-400">ID: <span className="font-bold">{aluno.id}</span></p>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-6">
+                                      {/* Info Secundária */}
+                                      {viewMode === 'auditoria' ? (
+                                        <>
+                                          {/* Status Material */}
+                                          {aluno.material.loading ? (
+                                            <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
+                                          ) : (
+                                            <div className={`px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border flex items-center gap-1.5 min-w-[140px] justify-center ${aluno.material.comprou
+                                              ? 'bg-blue-50 border-blue-100 text-blue-600'
+                                              : 'bg-slate-50 border-slate-100 text-slate-300'
+                                              }`}>
+                                              {aluno.material.comprou ? (
+                                                <><BookCheck size={12} /> {aluno.material.det.substring(0, 15)}...</>
+                                              ) : (
+                                                <><XCircle size={12} /> Não Identificado</>
+                                              )}
+                                            </div>
+                                          )}
+
+                                          {/* Status Pagamento */}
+                                          <div className="w-28 text-right">
+                                            {aluno.material.loading ? (
+                                              <div className="w-16 h-4 bg-slate-100 rounded animate-pulse ml-auto" />
+                                            ) : aluno.material.comprou ? (
+                                              aluno.material.pago ? (
+                                                <div className="inline-flex items-center gap-1.5 text-green-600 font-black text-[10px] uppercase tracking-widest bg-green-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-green-600/20">
+                                                  <CheckCircle size={12} /> Pago
+                                                </div>
+                                              ) : (
+                                                <div className="inline-flex items-center gap-1.5 text-orange-600 font-black text-[10px] uppercase tracking-widest bg-orange-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-orange-600/20 animate-pulse">
+                                                  <DollarSign size={12} /> Pendente
+                                                </div>
+                                              )
+                                            ) : (
+                                              <span className="text-slate-200 font-bold text-xl">-</span>
+                                            )}
+                                          </div>
+                                        </>
+                                      ) : (
+                                        <>
+                                          {/* Status Veterano */}
+                                          {aluno.material.loading ? (
+                                            <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
+                                          ) : aluno.material.anosAnteriores?.length > 0 ? (
+                                            <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-indigo-50 border-indigo-100 text-indigo-600 flex items-center gap-1.5 min-w-[140px] justify-center">
+                                              <GraduationCap size={12} /> Veterano ({aluno.material.anosAnteriores.map(a => a.ano).join(', ')})
+                                            </div>
+                                          ) : (
+                                            <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-slate-50 border-slate-100 text-slate-400 flex items-center gap-1.5 min-w-[140px] justify-center">
+                                              <User size={12} /> Novato (Só 2026)
+                                            </div>
+                                          )}
+
+                                          {/* Botão Ver Notas */}
+                                          <div className="w-28 text-right">
+                                            {!aluno.material.loading && aluno.material.anosAnteriores?.length > 0 && (
+                                              <button
+                                                onClick={(e) => { e.stopPropagation(); fetchBoletimAluno(aluno); }}
+                                                className="inline-flex items-center gap-1.5 text-indigo-600 font-black text-[10px] uppercase tracking-widest bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-200 hover:bg-indigo-600 hover:text-white transition-colors"
+                                              >
+                                                <BookCheck size={12} /> Ver Notas
+                                              </button>
+                                            )}
+                                          </div>
+                                        </>
+                                      )}
+
+                                      {/* Botão Mais Opções */}
+                                      <button
+                                        onClick={(e) => { e.stopPropagation(); fetchDetalhesAluno(aluno); }}
+                                        className="w-8 h-8 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-orange-500 transition-colors"
+                                      >
+                                        <div className="flex gap-0.5">
+                                          <div className="w-1 h-1 bg-current rounded-full"></div>
+                                          <div className="w-1 h-1 bg-current rounded-full"></div>
+                                          <div className="w-1 h-1 bg-current rounded-full"></div>
+                                        </div>
+                                      </button>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : (
+                              <div className="p-16 text-center text-slate-400 flex flex-col items-center">
+                                {loadingAlunos ? (
+                                  <div className="flex flex-col items-center gap-3">
+                                    <Loader2 className="animate-spin text-orange-400" size={32} />
+                                    <p className="text-[10px] font-black uppercase tracking-widest">Carregando...</p>
+                                  </div>
+                                ) : (
+                                  <>
+                                    <Users size={32} className="opacity-20 mb-3" />
+                                    <p className="text-[10px] font-black uppercase tracking-widest">Nenhum aluno encontrado</p>
+                                  </>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Footer Stats */}
+                            {!loadingAlunos && alunos.length > 0 && (
+                              <div className="bg-slate-50 border-t border-slate-100 p-4 px-6 flex justify-between items-center text-[10px] font-black uppercase tracking-widest">
+                                <div className="flex gap-6">
+                                  <span className="flex items-center gap-2 text-green-600">
+                                    <div className="w-2 h-2 bg-green-500 rounded-full" />
+                                    Pagos: {alunos.filter(a => a.material.pago).length}
+                                  </span>
+                                  <span className="flex items-center gap-2 text-orange-600">
+                                    <div className="w-2 h-2 bg-orange-500 rounded-full" />
+                                    Pendentes: {alunos.filter(a => a.material.comprou && !a.material.pago).length}
+                                  </span>
+                                </div>
+                                <span className="text-slate-400">Total: {alunos.length} Alunos</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))}
+
+                {turmas.length === 0 && !loadingTurmas && (
+                  <div className="py-32 flex flex-col items-center justify-center text-center opacity-40">
+                    <School size={64} className="text-slate-300 stroke-1 mb-4" />
+                    <p className="text-sm font-black text-slate-400 uppercase tracking-[0.3em]">Nenhuma turma carregada</p>
+                    <p className="text-[10px] font-bold text-slate-300 mt-2">Selecione uma unidade e clique em carregar</p>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* BARRA LATERAL - ALUNOS SALVOS */}
+        <div
+          className="w-full lg:w-[360px] shrink-0 bg-white rounded-[2rem] shadow-sm border border-slate-200 transaction-all duration-300 overflow-hidden flex flex-col sticky top-8 max-h-[calc(100vh-4rem)]"
+        >
+          <div className="p-6 bg-slate-50 border-b border-slate-100">
+            <div className="flex justify-between items-center mb-1">
+              <h3 className="font-black text-slate-800 uppercase tracking-tight text-sm flex items-center gap-2">
+                Alunos Salvos
+                <span className="bg-indigo-100 text-indigo-600 text-[10px] px-2 py-0.5 rounded-full">{savedStudents.length}</span>
+              </h3>
+              <div className="flex gap-2">
+                {savedStudents.length > 0 && (
+                  <button
+                    onClick={() => setSavedStudents([])}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-slate-400 bg-slate-200 hover:bg-red-50 hover:text-red-500 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors"
+                  >
+                    Limpar
+                  </button>
+                )}
+                <button
+                  onClick={handleExportSavedStudents}
+                  disabled={savedStudents.length === 0 || exportingSavedStudents}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors shadow-sm disabled:shadow-none disabled:bg-slate-200 disabled:text-slate-400 ${exportingSavedStudents ? 'bg-amber-500' : 'bg-green-600 hover:bg-green-500'}`}
+                >
+                  {exportingSavedStudents ? <Loader2 size={12} className="animate-spin" /> : <FileSpreadsheet size={12} />}
+                  {exportingSavedStudents && exportProgress ? `${exportProgress.current}/${exportProgress.total}` : 'Exportar'}
+                </button>
+              </div>
+            </div>
+
+            <div className="min-h-[16px]">
+              {exportingSavedStudents && exportProgress ? (
+                <p className="text-[10px] text-amber-600 font-bold uppercase tracking-widest flex items-center gap-1.5 truncate">
+                  Buscando: {exportProgress.studentName}
+                </p>
+              ) : exportErrors.length > 0 ? (
+                <p className="text-[10px] text-red-500 font-bold uppercase tracking-widest flex items-center gap-1.5 truncate" title={`Erro em: ${exportErrors.join(', ')}`}>
+                  <AlertCircle size={10} /> Não foi possível buscar as notas de {exportErrors.length} aluno(s)
+                </p>
+              ) : (
+                <p className="text-[10px] text-slate-400 uppercase tracking-widest">
+                  Adicione alunos clicando no '+' na pesquisa
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="p-4 flex-1 overflow-y-auto space-y-2">
+            {savedStudents.length === 0 ? (
+              <div className="py-12 flex flex-col items-center text-center opacity-40">
+                <Users size={32} className="text-slate-300 mb-3" />
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno salvo</p>
+              </div>
+            ) : (
+              savedStudents.map((student, idx) => (
+                <div
+                  key={`saved-${idx}`}
+                  onClick={() => fetchGlobalDetalhes(student)}
+                  className="p-3 bg-white border border-slate-100 rounded-2xl hover:border-orange-200 hover:shadow-sm transition-all cursor-pointer group relative"
+                >
+                  <div className="flex items-center gap-3 pr-6">
+                    <div className="w-8 h-8 rounded-xl bg-slate-100 text-slate-500 group-hover:bg-indigo-100 group-hover:text-indigo-600 flex items-center justify-center font-black text-[10px] flex-shrink-0 transition-colors">
+                      {student.nome.charAt(0)}
+                    </div>
+                    <div className="flex-1 overflow-hidden">
+                      <p className="font-bold text-xs text-slate-800 truncate group-hover:text-indigo-900">{student.nome}</p>
+                      {student.unidades && student.unidades.length > 0 ? (
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {student.unidades.map(u => (
+                            <span key={u.unidadeKey} className="text-[8px] font-black uppercase tracking-widest text-slate-400 group-hover:text-indigo-500 bg-slate-50 group-hover:bg-indigo-50 px-1.5 py-0.5 rounded border border-slate-100 group-hover:border-indigo-100 truncate max-w-full">{u.unidadeNome}</span>
                           ))}
                         </div>
                       ) : (
-                        <div className="p-16 text-center text-slate-400 flex flex-col items-center">
-                          {loadingAlunos ? (
-                            <div className="flex flex-col items-center gap-3">
-                              <Loader2 className="animate-spin text-orange-400" size={32} />
-                              <p className="text-[10px] font-black uppercase tracking-widest">Carregando...</p>
-                            </div>
-                          ) : (
-                            <>
-                              <Users size={32} className="opacity-20 mb-3" />
-                              <p className="text-[10px] font-black uppercase tracking-widest">Nenhum aluno encontrado</p>
-                            </>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Footer Stats */}
-                      {!loadingAlunos && alunos.length > 0 && (
-                        <div className="bg-slate-50 border-t border-slate-100 p-4 px-6 flex justify-between items-center text-[10px] font-black uppercase tracking-widest">
-                          <div className="flex gap-6">
-                            <span className="flex items-center gap-2 text-green-600">
-                              <div className="w-2 h-2 bg-green-500 rounded-full" />
-                              Pagos: {alunos.filter(a => a.material.pago).length}
-                            </span>
-                            <span className="flex items-center gap-2 text-orange-600">
-                              <div className="w-2 h-2 bg-orange-500 rounded-full" />
-                              Pendentes: {alunos.filter(a => a.material.comprou && !a.material.pago).length}
-                            </span>
-                          </div>
-                          <span className="text-slate-400">Total: {alunos.length} Alunos</span>
-                        </div>
+                        <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 group-hover:text-indigo-400 truncate mt-0.5">{student.unidadeNome}</p>
                       )}
                     </div>
                   </div>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSavedStudents(prev => prev.filter(s => s.nome !== student.nome));
+                    }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+                    title="Remover"
+                  >
+                    <XCircle size={14} />
+                  </button>
                 </div>
-              )}
-            </div>
-          ))}
-
-          {turmas.length === 0 && !loadingTurmas && (
-            <div className="py-32 flex flex-col items-center justify-center text-center opacity-40">
-              <School size={64} className="text-slate-300 stroke-1 mb-4" />
-              <p className="text-sm font-black text-slate-400 uppercase tracking-[0.3em]">Nenhuma turma carregada</p>
-              <p className="text-[10px] font-bold text-slate-300 mt-2">Selecione uma unidade e clique em carregar</p>
-            </div>
-          )}
+              ))
+            )}
+          </div>
         </div>
       </div>
+
+      {/* Modal de Seleção de Disciplinas para Exportação */}
+      {exportModalData && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => setExportModalData(null)}>
+          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="bg-gradient-to-br from-indigo-700 to-indigo-900 p-6 text-white relative overflow-hidden flex-shrink-0">
+              <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, white 0%, transparent 60%)' }} />
+              <div className="relative z-10 flex items-start justify-between">
+                <div>
+                  <h3 className="font-black text-xl uppercase tracking-tight leading-tight flex items-center gap-2">
+                    <FileSpreadsheet size={24} /> Exportar Notas
+                  </h3>
+                  <p className="text-indigo-200 text-xs font-bold uppercase tracking-widest mt-1">
+                    Selecione as disciplinas que deseja incluir
+                  </p>
+                </div>
+                <button onClick={() => setExportModalData(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
+                  <XCircle size={20} className="text-white" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-1">
+              <div className="flex items-center justify-between mb-4 pb-4 border-b border-slate-100">
+                <span className="text-[10px] font-black tracking-widest uppercase text-slate-500">
+                  {exportModalData.uniqueDisciplines.length} Disciplinas Encontradas
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setSelectedExportDisciplines(new Set(exportModalData.uniqueDisciplines))}
+                    className="text-[9px] font-bold tracking-widest uppercase text-indigo-600 bg-indigo-50 px-2 py-1.5 rounded-md border border-indigo-100 hover:bg-indigo-100 transition-colors"
+                  >
+                    Todas
+                  </button>
+                  <button
+                    onClick={() => setSelectedExportDisciplines(new Set())}
+                    className="text-[9px] font-bold tracking-widest uppercase text-slate-500 bg-slate-50 px-2 py-1.5 rounded-md border border-slate-200 hover:bg-slate-100 transition-colors"
+                  >
+                    Nenhuma
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                {exportModalData.uniqueDisciplines.map(disc => {
+                  const isChecked = selectedExportDisciplines.has(disc);
+                  return (
+                    <label key={disc} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${isChecked ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => {
+                          setSelectedExportDisciplines(prev => {
+                            const newSet = new Set(prev);
+                            if (isChecked) newSet.delete(disc);
+                            else newSet.add(disc);
+                            return newSet;
+                          });
+                        }}
+                        className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shadow-sm"
+                      />
+                      <span className={`text-sm font-bold uppercase tracking-tight ${isChecked ? 'text-indigo-900' : 'text-slate-600'}`}>{disc}</span>
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-end gap-3 flex-shrink-0">
+              <button
+                onClick={() => setExportModalData(null)}
+                className="px-5 py-3 rounded-xl text-slate-500 font-bold uppercase tracking-widest text-xs hover:bg-slate-200 transition-colors"
+              >
+                Cancelar
+              </button>
+              <button
+                onClick={confirmExportSelection}
+                disabled={selectedExportDisciplines.size === 0}
+                className="px-6 py-3 bg-indigo-600 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-md shadow-indigo-200 hover:bg-indigo-700 transition-all disabled:opacity-50 disabled:shadow-none flex items-center gap-2"
+              >
+                <FileSpreadsheet size={16} /> Baixar Planilha
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
