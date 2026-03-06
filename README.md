@@ -163,7 +163,11 @@ GET /WSAPIEdu.asmx/GetNotaParcial
   - Exibe a unidade e a turma de cada registro histórico.
 - **Botões de Cópia Direta:** Implementados nos campos Nome (header), Matrícula, Nascimento e CPF.
   - **Feedback:** Ícone de "check" verde por 2 segundos após a cópia.
+- **Visualização de Turma Atual:** Substituição do campo "Responsável" pela "Turma Atual" do aluno.
+  - **Identificação Inteligente:** Para alunos inativos, o sistema percorre o histórico em todas as unidades para encontrar a última turma registrada.
 - **Visualização de Notas Parciais:** Badges laranja exibem o detalhamento (VAD, VAO, VAF) logo abaixo da média de cada disciplina.
+- **Menu de Configurações & Alunos Salvos:** A lista de alunos salvos foi movida para um menu de configurações (ícone de engrenagem) no topo superior direito. O menu permite ver, limpar e exportar os alunos salvos, otimizando o espaço da tela principal e removendo a barra lateral fixa.
+- **Indicador de Status (Ativo/Inativo):** Exibição clara da situação do aluno (Ativo em verde, Inativo em vermelho) nos resultados de busca e detalhes.
 
 ---
 
@@ -257,6 +261,10 @@ Caso um aluno tenha mudado de turma em 2025 (ex: transferência interna), o sist
 | 2026-03 | Adição de botões de cópia com feedback visual (Check verde) |
 | 2026-03 | Implementação da visualização detalhada de **Notas Parciais (VAD/VAO/VAF)** |
 | 2026-03 | Padronização Visual Laranja e Consolidação da Documentação Técnica |
+| 2026-03 | Refatoração: **Menu de Configurações** no topo direito com Alunos Salvos (Sidebar removida) |
+| 2026-03 | Adição de **Indicador de Status Ativo/Inativo** textual e colorido na busca global |
+| 2026-03 | Atualização do Modal: Substituição de 'Responsável' por **'Turma Atual'** |
+| 2026-03 | Melhoria: Busca exaustiva de matrícula em todas as unidades para alunos inativos |
 
 ---
 

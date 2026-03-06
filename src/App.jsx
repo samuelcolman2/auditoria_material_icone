@@ -1,6 +1,6 @@
 ﻿import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy } from 'lucide-react';
+import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy, Settings } from 'lucide-react';
 
 const App = () => {
   const [loadingTurmas, setLoadingTurmas] = useState(false);
@@ -44,10 +44,25 @@ const App = () => {
   const [selectedExportDisciplines, setSelectedExportDisciplines] = useState(new Set());
   const [exportProgress, setExportProgress] = useState(null);
   const [exportErrors, setExportErrors] = useState([]);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSavedStudentsModalOpen, setIsSavedStudentsModalOpen] = useState(false);
+  const [isDarkMode, setIsDarkMode] = useState(() => {
+    const saved = localStorage.getItem('isDarkMode');
+    return saved ? JSON.parse(saved) : false;
+  });
 
   useEffect(() => {
     localStorage.setItem('savedStudents', JSON.stringify(savedStudents));
   }, [savedStudents]);
+
+  useEffect(() => {
+    localStorage.setItem('isDarkMode', JSON.stringify(isDarkMode));
+    if (isDarkMode) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [isDarkMode]);
 
   // Configuração das unidades (Tokens e Códigos agora estão no Backend)
   // Configuração das unidades
@@ -96,32 +111,72 @@ const App = () => {
       nodes.forEach(node => {
         const id = node.getElementsByTagName('AlunoID')[0]?.textContent;
         const nome = node.getElementsByTagName('Nome')[0]?.textContent;
+        const situacao = node.getElementsByTagName('Situacao')[0]?.textContent || 'Inativo';
         if (id && id !== '0' && nome) {
           const nomeNormalizado = removeAccents(nome);
           // Verifica se TODAS as partes pesquisadas estão no nome do aluno (não importando a ordem ou distância)
           const matchesAll = searchTerms.every(term => nomeNormalizado.includes(term));
 
           if (matchesAll) {
-            results.push({ id, nome, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
+            results.push({ id, nome, situacao, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
           }
         }
       });
     }));
 
-    // Agrupar estudantes pelo nome (mesmo estudante em várias unidades)
     const grouped = new Map();
     results.forEach(r => {
       const gName = removeAccents(r.nome);
       if (!grouped.has(gName)) {
-        grouped.set(gName, { nome: r.nome, id: r.id, unidadeKey: r.unidadeKey, unidadeNome: r.unidadeNome, unidades: [] });
+        grouped.set(gName, { nome: r.nome, id: r.id, situacao: r.situacao, unidadeKey: r.unidadeKey, unidadeNome: r.unidadeNome, unidades: [] });
       }
+
       const group = grouped.get(gName);
+
+      // PRIORIDADE: Se o registro atual é INATIVO mas encontramos um ATIVO, trocamos os dados principais
+      if (group.situacao !== 'Ativo' && r.situacao === 'Ativo') {
+        group.id = r.id;
+        group.situacao = r.situacao;
+        group.unidadeKey = r.unidadeKey;
+        group.unidadeNome = r.unidadeNome;
+      }
+
       if (!group.unidades.some(u => u.unidadeKey === r.unidadeKey)) {
         group.unidades.push({ id: r.id, unidadeKey: r.unidadeKey, unidadeNome: r.unidadeNome });
       }
     });
 
-    const finalResults = Array.from(grouped.values()).slice(0, 15);
+    const finalResults = Array.from(grouped.values())
+      .sort((a, b) => {
+        if (a.situacao === 'Ativo' && b.situacao !== 'Ativo') return -1;
+        if (a.situacao !== 'Ativo' && b.situacao === 'Ativo') return 1;
+        return a.nome.localeCompare(b.nome);
+      })
+      .slice(0, 15);
+
+    // BÔNUS: Para cada resultado final que esteja ATIVO, vamos buscar a turma atual dele
+    // Fazemos isso em paralelo para ser rápido
+    await Promise.all(finalResults.map(async (res) => {
+      if (res.situacao === 'Ativo') {
+        try {
+          // Busca matrícula na unidade principal do resultado
+          const matXml = await callSponteForUnit(res.unidadeKey, 'GetMatriculas', `alunoid=${res.id}`);
+          if (matXml) {
+            const mats = Array.from(matXml.getElementsByTagName('wsMatricula'));
+            // Pega a matrícula de 2026 ou a mais recente
+            const mat2026 = mats.find(m => (m.getElementsByTagName('AnoLetivo')[0]?.textContent || '') === '2026');
+            const matRecente = mat2026 || mats[0];
+
+            if (matRecente) {
+              res.turmaNome = matRecente.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+            }
+          }
+        } catch (e) {
+          console.error("Erro ao buscar turma para pesquisa global", e);
+        }
+      }
+    }));
+
     setGlobalSearchResults(finalResults);
     setGlobalSearchLoading(false);
   }, [callSponteForUnit]);
@@ -321,6 +376,55 @@ const App = () => {
             }
           } catch (e) { }
         }
+
+        // Busca turma do aluno em todas as unidades para achar a mais recente
+        let turmaNome = alunoResult.turmaNome || '';
+        if (!turmaNome) {
+          try {
+            const studentUnits = alunoResult.unidades && alunoResult.unidades.length > 0
+              ? alunoResult.unidades
+              : [{ id: alunoResult.id, unidadeKey: alunoResult.unidadeKey }];
+
+            const allEnrollments = [];
+
+            await Promise.all(studentUnits.map(async (unit) => {
+              const matXml = await callSponteForUnit(unit.unidadeKey, 'GetMatriculas', `alunoid=${unit.id}`);
+              if (matXml) {
+                const mats = Array.from(matXml.getElementsByTagName('wsMatricula'));
+                mats.forEach(m => {
+                  const dataInicio = m.getElementsByTagName('DataInicio')[0]?.textContent || '';
+                  const dataMatricula = m.getElementsByTagName('DataMatricula')[0]?.textContent || '';
+                  const anoLetivo = m.getElementsByTagName('AnoLetivo')[0]?.textContent || '';
+                  const nomeTurma = m.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+
+                  let ano = '';
+                  if (dataInicio) {
+                    if (dataInicio.includes('/')) ano = dataInicio.split(' ')[0].split('/')[2];
+                    else if (dataInicio.includes('-')) ano = dataInicio.split('T')[0].split('-')[0];
+                  }
+                  if (!ano && dataMatricula) {
+                    if (dataMatricula.includes('/')) ano = dataMatricula.split(' ')[0].split('/')[2];
+                    else if (dataMatricula.includes('-')) ano = dataMatricula.split('T')[0].split('-')[0];
+                  }
+                  if (!ano) ano = anoLetivo;
+
+                  if (nomeTurma && ano && ano.length === 4) {
+                    allEnrollments.push({ ano: parseInt(ano), nomeTurma });
+                  }
+                });
+              }
+            }));
+
+            if (allEnrollments.length > 0) {
+              // Ordena por ano decrescente numericamente
+              allEnrollments.sort((a, b) => b.ano - a.ano);
+              turmaNome = allEnrollments[0].nomeTurma;
+            }
+          } catch (e) {
+            console.error("Erro ao buscar turma recente", e);
+          }
+        }
+
         const matricula = alunoNode.getElementsByTagName('NumeroMatricula')[0]?.textContent || alunoNode.getElementsByTagName('RA')[0]?.textContent || '';
         setGlobalDetalhes({
           aluno: alunoResult,
@@ -330,7 +434,7 @@ const App = () => {
             dataNascimento: dataNasc || '--',
             cpf: alunoNode.getElementsByTagName('CPF')[0]?.textContent || '--',
             email: alunoNode.getElementsByTagName('Email')[0]?.textContent || '--',
-            responsavel: 'Consultar Secretaria',
+            turma: turmaNome || 'Não informado',
           }
         });
       } else {
@@ -897,7 +1001,7 @@ const App = () => {
         cpf: alunoNode.getElementsByTagName('CPF')[0]?.textContent || '--',
         email: alunoNode.getElementsByTagName('Email')[0]?.textContent || '--',
         matricula: alunoNode.getElementsByTagName('NumeroMatricula')[0]?.textContent || alunoNode.getElementsByTagName('RA')[0]?.textContent || aluno.id,
-        responsavel: 'Consultar Secretaria', // GetAlunos padrão não traz nome do responsável direto
+        turma: (turmas.find(t => t.id === selectedTurmaId)?.nome) || 'Não informado',
         loading: false
       };
 
@@ -1001,7 +1105,187 @@ const App = () => {
     : (filtroVeteranos ? alunos.filter(a => a.material?.anosAnteriores && a.material.anosAnteriores.length > 0) : alunos);
 
   return (
-    <div className="min-h-screen bg-[#f3f4f6] p-4 md:p-8 font-sans text-slate-900 antialiased selection:bg-orange-100">
+    <div className={`min-h-screen transition-colors duration-500 ${isDarkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-[#f3f4f6] text-slate-900'} p-4 md:p-8 font-sans antialiased selection:bg-orange-100 relative`}>
+
+      {/* BOTÃO DE CONFIGURAÇÕES (TOP RIGHT) */}
+      <div className="absolute top-4 right-4 md:top-8 md:right-8 z-40">
+        <button
+          onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+          className={`p-3 rounded-2xl transition-all shadow-sm flex items-center gap-2 group ${isSettingsOpen ? 'bg-orange-600 text-white shadow-orange-200' : 'bg-white text-slate-400 hover:text-orange-500 hover:shadow-md'}`}
+        >
+          <Settings size={20} className={isSettingsOpen ? 'animate-spin-slow' : 'group-hover:rotate-90 transition-transform duration-500'} />
+          <span className="text-[10px] font-black uppercase tracking-widest hidden sm:block">Configurações</span>
+          {savedStudents.length > 0 && (
+            <span className="absolute -top-1 -right-1 w-5 h-5 bg-orange-500 text-white text-[10px] font-black flex items-center justify-center rounded-full border-2 border-[#f3f4f6] animate-bounce">
+              {savedStudents.length}
+            </span>
+          )}
+        </button>
+
+        {/* DROPDOWN DE CONFIGURAÇÕES */}
+        {isSettingsOpen && (
+          <div className="absolute right-0 mt-3 w-64 bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl rounded-[2rem] shadow-2xl border border-white/20 dark:border-slate-800/50 overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200 z-50 transition-colors">
+            <div className="p-5 border-b border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-900/50">
+              <h3 className="text-[10px] font-black uppercase tracking-[0.2em] text-slate-400 dark:text-slate-500 flex items-center gap-2">
+                <Settings size={12} /> Painel de Controle
+              </h3>
+            </div>
+
+            <div className="p-2">
+              <button
+                onClick={() => { setIsSavedStudentsModalOpen(true); setIsSettingsOpen(false); }}
+                className="w-full flex items-center justify-between p-4 hover:bg-orange-50 dark:hover:bg-orange-950/30 rounded-[1.5rem] transition-all group text-left"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 flex items-center justify-center group-hover:bg-orange-600 group-hover:text-white transition-colors">
+                    <Users size={20} />
+                  </div>
+                  <div>
+                    <p className="font-black text-[11px] text-slate-700 dark:text-slate-200 uppercase tracking-tight">Alunos Salvos</p>
+                    <p className="text-[9px] text-slate-400 dark:text-slate-500 font-bold uppercase tracking-widest">{savedStudents.length} Registro(s)</p>
+                  </div>
+                </div>
+                <div className="w-8 h-8 rounded-full bg-slate-50 dark:bg-slate-800 flex items-center justify-center text-slate-300 group-hover:bg-orange-200 dark:group-hover:bg-orange-900 group-hover:text-orange-600 transition-colors">
+                  <ChevronDown size={16} className="-rotate-90" />
+                </div>
+              </button>
+
+              {/* Toggle Dark Mode */}
+              <div className="mt-2 p-1">
+                <button
+                  onClick={() => setIsDarkMode(!isDarkMode)}
+                  className="w-full flex items-center justify-between p-4 hover:bg-slate-50 dark:hover:bg-slate-800/50 rounded-[1.5rem] transition-all group text-left"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all ${isDarkMode ? 'bg-orange-600 text-white shadow-lg shadow-orange-900/40' : 'bg-slate-100 text-slate-400 group-hover:bg-orange-100 group-hover:text-orange-600'}`}>
+                      {isDarkMode ? <RefreshCw size={18} className="animate-spin-slow" /> : <Globe size={18} />}
+                    </div>
+                    <div>
+                      <p className="font-black text-[11px] text-slate-700 dark:text-slate-200 uppercase tracking-tight">Modo {isDarkMode ? 'Escuro' : 'Claro'}</p>
+                      <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest">Tema Visual Atual</p>
+                    </div>
+                  </div>
+                  <div className={`w-12 h-6 rounded-full p-1 transition-colors duration-300 flex items-center ${isDarkMode ? 'bg-orange-600' : 'bg-slate-200'}`}>
+                    <div className={`w-4 h-4 bg-white rounded-full shadow-sm transition-transform duration-300 ${isDarkMode ? 'translate-x-6' : 'translate-x-0'}`} />
+                  </div>
+                </button>
+              </div>
+
+              <div className="mt-1 px-2 py-4 text-center">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-slate-100 dark:bg-slate-800 rounded-full border border-slate-200 dark:border-slate-700">
+                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                  <span className="text-[8px] font-black text-slate-400 uppercase tracking-[0.2em]">Versão 2.5 • Estável</span>
+                </div>
+              </div>
+            </div>
+
+            <div className={`p-4 text-center transition-colors ${isDarkMode ? 'bg-slate-900' : 'bg-slate-100 border-t border-slate-200'}`}>
+              <p className={`text-[8px] font-black uppercase tracking-[0.3em] ${isDarkMode ? 'text-slate-500' : 'text-slate-400'}`}>ÍCONE COLÉGIO E CURSO</p>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* MODAL CENTRAL DE ALUNOS SALVOS */}
+      {isSavedStudentsModalOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-md animate-in fade-in duration-300" onClick={() => setIsSavedStudentsModalOpen(false)}>
+          <div className="bg-white dark:bg-slate-950 rounded-[2.5rem] shadow-2xl w-full max-w-2xl max-h-[85vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-300 border border-white/10 dark:border-slate-800/50" onClick={e => e.stopPropagation()}>
+            <div className={`p-8 text-white relative overflow-hidden flex-shrink-0 transition-all border-b ${isDarkMode ? 'bg-black border-slate-800' : 'bg-slate-50 text-slate-900 border-slate-100'}`}>
+              <div className={`absolute top-0 right-0 w-64 h-64 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 pointer-events-none transition-colors ${isDarkMode ? 'bg-orange-500/5' : 'bg-orange-500/10'}`}></div>
+              <div className="relative z-10 flex items-center justify-between">
+                <div className="flex items-center gap-5">
+                  <div className="w-14 h-14 rounded-2xl bg-orange-600 flex items-center justify-center shadow-lg shadow-orange-600/20">
+                    <Users size={28} className="text-white" />
+                  </div>
+                  <div>
+                    <h3 className={`font-black text-2xl uppercase tracking-tighter leading-none transition-colors ${isDarkMode ? 'text-white' : 'text-slate-900'}`}>Alunos Ativos na Seleção</h3>
+                    <div className="flex items-center gap-2 mt-2">
+                      <span className="w-2 h-2 rounded-full bg-orange-500"></span>
+                      <p className="text-slate-500 dark:text-slate-400 text-[10px] font-black uppercase tracking-[0.2em] transition-colors">Gerenciamento de Exportação em Lote</p>
+                    </div>
+                  </div>
+                </div>
+                <button onClick={() => setIsSavedStudentsModalOpen(false)} className="p-3 bg-slate-200/50 dark:bg-white/10 rounded-2xl hover:bg-slate-200 dark:hover:bg-white/20 transition-colors text-slate-400 dark:text-white">
+                  <XCircle size={24} />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-8 pb-4 flex-1 overflow-y-auto bg-slate-50/30 dark:bg-slate-900/20">
+              {savedStudents.length === 0 ? (
+                <div className="py-20 flex flex-col items-center text-center">
+                  <div className="w-20 h-20 bg-slate-100 dark:bg-slate-900 rounded-full flex items-center justify-center mb-6 opacity-50">
+                    <Users size={32} className="text-slate-300 dark:text-slate-700" />
+                  </div>
+                  <p className="text-sm font-black text-slate-400 dark:text-slate-600 uppercase tracking-widest">Nenhum aluno na lista de exportação</p>
+                  <p className="text-[10px] text-slate-300 dark:text-slate-700 font-bold mt-2 uppercase">Adicione alunos clicando no ícone "+" nos resultados da pesquisa</p>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {savedStudents.map((student, idx) => (
+                    <div key={idx} className="group flex items-center justify-between p-4 bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 transition-all hover:border-orange-200 dark:hover:border-orange-900 hover:shadow-xl hover:shadow-orange-900/5 relative overflow-hidden">
+                      <div className="flex items-center gap-3 min-w-0 pr-8 cursor-pointer relative z-10" onClick={() => { fetchGlobalDetalhes(student); setIsSavedStudentsModalOpen(false); }}>
+                        <div className="w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 group-hover:bg-orange-100 dark:group-hover:bg-orange-900 group-hover:text-orange-600 dark:group-hover:text-orange-400 flex items-center justify-center font-black text-sm transition-colors">
+                          {student.nome.charAt(0)}
+                        </div>
+                        <div className="min-w-0">
+                          <p className="font-bold text-xs text-slate-800 dark:text-slate-200 truncate group-hover:text-orange-600 dark:group-hover:text-orange-400 transition-colors">{student.nome}</p>
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            <span className="text-[8px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 truncate max-w-[120px]">{student.unidadeNome}</span>
+                            <span className={`w-1.5 h-1.5 rounded-full ${student.situacao === 'Ativo' ? 'bg-green-500' : 'bg-red-500'}`}></span>
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => setSavedStudents(prev => prev.filter(s => s.nome !== student.nome))}
+                        className="p-2 text-slate-300 dark:text-slate-700 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 rounded-xl transition-all opacity-0 group-hover:opacity-100 absolute right-3 z-20"
+                      >
+                        <XCircle size={18} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {savedStudents.length > 0 && (
+              <div className="p-8 bg-white dark:bg-slate-950 border-t border-slate-100 dark:border-slate-800 flex flex-col md:flex-row gap-4 flex-shrink-0">
+                <button
+                  onClick={() => setSavedStudents([])}
+                  className="flex-1 flex items-center justify-center gap-3 p-4 bg-slate-100 dark:bg-slate-900 hover:bg-red-50 dark:hover:bg-red-950/30 text-slate-400 dark:text-slate-500 hover:text-red-600 dark:hover:text-red-400 rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] transition-all border border-slate-200 dark:border-slate-800"
+                >
+                  <RefreshCw size={16} /> Limpar Seleção
+                </button>
+                <button
+                  onClick={handleExportSavedStudents}
+                  disabled={exportingSavedStudents}
+                  className="flex-[2] flex items-center justify-center gap-3 p-4 bg-orange-600 hover:bg-orange-500 text-white rounded-2xl text-[11px] font-black uppercase tracking-[0.2em] transition-all shadow-lg shadow-orange-600/20 hover:shadow-orange-600/40 hover:-translate-y-0.5 disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none translate-y-0"
+                >
+                  {exportingSavedStudents ? <Loader2 size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
+                  {exportingSavedStudents ? 'Processando Exportação...' : 'Gerar Planilha Consolidada'}
+                </button>
+              </div>
+            )}
+
+            {exportingSavedStudents && exportProgress && (
+              <div className="px-8 pb-8 bg-white">
+                <div className="bg-orange-50 rounded-2xl p-4 border border-orange-100 flex flex-col gap-2">
+                  <div className="flex justify-between items-center text-[10px] font-black uppercase tracking-widest text-orange-600">
+                    <span>Progresso: {exportProgress.studentName}</span>
+                    <span>{Math.round((exportProgress.current / exportProgress.total) * 100)}%</span>
+                  </div>
+                  <div className="h-1.5 bg-orange-200/30 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-orange-500 transition-all duration-300"
+                      style={{ width: `${(exportProgress.current / exportProgress.total) * 100}%` }}
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* MODAL DE DETALHES GLOBAL (PESQUISA) */}
       {globalDetalhes && (
@@ -1015,23 +1299,35 @@ const App = () => {
                   <div className="w-12 h-12 rounded-2xl bg-green-500 flex items-center justify-center font-black text-lg text-white shadow-lg shadow-green-900/20">
                     {globalDetalhes.aluno.nome.charAt(0)}
                   </div>
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{globalDetalhes.aluno.nome}</h3>
-                      <button
-                        onClick={() => { navigator.clipboard.writeText(globalDetalhes.aluno.nome); setCopiedField('nome'); setTimeout(() => setCopiedField(null), 2000); }}
-                        className="p-1 rounded-lg bg-white/10 hover:bg-orange-500 text-slate-300 hover:text-white transition-all flex-shrink-0"
-                        title="Copiar nome"
-                      >
-                        {copiedField === 'nome' ? <CheckCircle size={13} /> : <Copy size={13} />}
-                      </button>
+                  <div className="flex flex-col">
+                    <div
+                      className="cursor-pointer group/name relative inline-block self-start"
+                      onClick={() => {
+                        navigator.clipboard.writeText(globalDetalhes.aluno.nome);
+                        setCopiedField('nome');
+                        setTimeout(() => setCopiedField(null), 2000);
+                      }}
+                    >
+                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight group-hover/name:text-orange-500 transition-colors flex items-center gap-2">
+                        {globalDetalhes.aluno.nome}
+                        {copiedField === 'nome' && (
+                          <span className="bg-orange-500 text-white text-[8px] px-1.5 py-0.5 rounded uppercase font-black tracking-widest animate-in fade-in zoom-in duration-200">
+                            Copiado!
+                          </span>
+                        )}
+                      </h3>
                     </div>
-                    <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Detalhes do Aluno</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <p className="text-slate-400 text-xs font-bold uppercase tracking-widest">Detalhes do Aluno</p>
+                      <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-md uppercase tracking-widest border ${globalDetalhes.aluno.situacao === 'Ativo' ? 'bg-green-500/20 border-green-500/50 text-green-400' : 'bg-red-500/20 border-red-500/50 text-red-400'}`}>
+                        {globalDetalhes.aluno.situacao}
+                      </span>
+                    </div>
                   </div>
+                  <button onClick={() => { setGlobalDetalhes(null); setGlobalBoletim(null); }} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
+                    <XCircle size={20} className="text-white" />
+                  </button>
                 </div>
-                <button onClick={() => { setGlobalDetalhes(null); setGlobalBoletim(null); }} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
-                  <XCircle size={20} className="text-white" />
-                </button>
               </div>
               {/* Tabs: Dados | Notas */}
               <div className="flex gap-2 mt-5">
@@ -1068,45 +1364,77 @@ const App = () => {
                 ) : globalDetalhes.data ? (
                   <div className="space-y-6">
                     <div className="grid grid-cols-2 gap-4">
-                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                      <div
+                        className="p-4 bg-slate-50 rounded-2xl border border-slate-100 cursor-pointer hover:border-orange-200 transition-colors group/field"
+                        onClick={() => {
+                          navigator.clipboard.writeText(globalDetalhes.data.matricula || '');
+                          setCopiedField('matricula');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
                         <div className="flex items-center justify-between mb-1">
                           <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5"><User size={10} /> Matrícula</p>
-                          <button onClick={() => { navigator.clipboard.writeText(globalDetalhes.data.matricula || ''); setCopiedField('matricula'); setTimeout(() => setCopiedField(null), 2000); }} className="p-0.5 rounded text-slate-300 hover:text-orange-500 transition-colors" title="Copiar">
-                            {copiedField === 'matricula' ? <CheckCircle size={11} className="text-green-500" /> : <Copy size={11} />}
-                          </button>
+                          {copiedField === 'matricula' && <CheckCircle size={11} className="text-green-500 animate-in zoom-in duration-200" />}
                         </div>
-                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.matricula || '--'}</p>
+                        <p className="font-bold text-slate-700 text-sm group-hover/field:text-orange-600 transition-colors">{globalDetalhes.data.matricula || '--'}</p>
                       </div>
-                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+
+                      <div
+                        className="p-4 bg-slate-50 rounded-2xl border border-slate-100 cursor-pointer hover:border-orange-200 transition-colors group/field"
+                        onClick={() => {
+                          navigator.clipboard.writeText(globalDetalhes.data.dataNascimento || '');
+                          setCopiedField('nasc');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
                         <div className="flex items-center justify-between mb-1">
                           <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5"><Calendar size={10} /> Nascimento</p>
-                          <button onClick={() => { navigator.clipboard.writeText(globalDetalhes.data.dataNascimento || ''); setCopiedField('nasc'); setTimeout(() => setCopiedField(null), 2000); }} className="p-0.5 rounded text-slate-300 hover:text-orange-500 transition-colors" title="Copiar">
-                            {copiedField === 'nasc' ? <CheckCircle size={11} className="text-green-500" /> : <Copy size={11} />}
-                          </button>
+                          {copiedField === 'nasc' && <CheckCircle size={11} className="text-green-500 animate-in zoom-in duration-200" />}
                         </div>
-                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.dataNascimento}</p>
+                        <p className="font-bold text-slate-700 text-sm group-hover/field:text-orange-600 transition-colors">{globalDetalhes.data.dataNascimento}</p>
                       </div>
                     </div>
                     <div className="space-y-4">
-                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-orange-100 transition-colors group">
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-orange-100 cursor-pointer transition-colors group"
+                        onClick={() => {
+                          navigator.clipboard.writeText(globalDetalhes.data.cpf || '');
+                          setCopiedField('cpf');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
                         <div className="w-10 h-10 rounded-xl bg-orange-50 flex items-center justify-center text-orange-500 group-hover:bg-orange-500 group-hover:text-white transition-colors"><User size={18} /></div>
-                        <div>
-                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">CPF</p>
-                          <p className="font-bold text-slate-700 font-mono text-sm">{globalDetalhes.data.cpf}</p>
+                        <div className="flex-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            CPF
+                            {copiedField === 'cpf' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 font-mono text-sm group-hover:text-orange-600 transition-colors">{globalDetalhes.data.cpf}</p>
                         </div>
                       </div>
-                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 transition-colors group">
+
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 cursor-pointer transition-colors group"
+                        onClick={() => {
+                          navigator.clipboard.writeText(globalDetalhes.data.email || '');
+                          setCopiedField('email');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
                         <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-500 group-hover:bg-blue-500 group-hover:text-white transition-colors"><div className="scale-75"><User size={20} /></div></div>
-                        <div className="overflow-hidden">
-                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Email</p>
-                          <p className="font-bold text-slate-700 text-sm truncate">{globalDetalhes.data.email}</p>
+                        <div className="overflow-hidden flex-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            Email
+                            {copiedField === 'email' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 text-sm truncate group-hover:text-blue-600 transition-colors">{globalDetalhes.data.email}</p>
                         </div>
                       </div>
                       <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100">
-                        <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500"><Users size={18} /></div>
+                        <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500"><LayoutList size={18} /></div>
                         <div>
-                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Responsável</p>
-                          <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.responsavel}</p>
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Turma Atual</p>
+                          <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.turma}</p>
                         </div>
                       </div>
                     </div>
@@ -1224,450 +1552,135 @@ const App = () => {
             </div>
           </div>
         </div>
-      )}
+      )
+      }
 
       {/* MODAL GLOBAL DE BOLETIM POR PESQUISA */}
-      {globalBoletim && !globalDetalhes && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => setGlobalBoletim(null)}>
-          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-            {/* Header */}
-            <div className="bg-gradient-to-br from-indigo-700 to-indigo-900 p-6 text-white relative overflow-hidden flex-shrink-0">
-              <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, white 0%, transparent 60%)' }} />
-              <div className="relative z-10 flex items-start justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center font-black text-xl">
-                    {globalBoletim.aluno.nome.charAt(0)}
+      {
+        globalBoletim && !globalDetalhes && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => setGlobalBoletim(null)}>
+            <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+              {/* Header */}
+              <div className="bg-gradient-to-br from-indigo-700 to-indigo-900 p-6 text-white relative overflow-hidden flex-shrink-0">
+                <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, white 0%, transparent 60%)' }} />
+                <div className="relative z-10 flex items-start justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 rounded-2xl bg-white/20 flex items-center justify-center font-black text-xl">
+                      {globalBoletim.aluno.nome.charAt(0)}
+                    </div>
+                    <div>
+                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{globalBoletim.aluno.nome}</h3>
+                      <p className="text-indigo-200 text-xs font-bold uppercase tracking-widest mt-1 flex items-center gap-1.5">
+                        <Globe size={11} /> Histórico Global — Todas as Unidades
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{globalBoletim.aluno.nome}</h3>
-                    <p className="text-indigo-200 text-xs font-bold uppercase tracking-widest mt-1 flex items-center gap-1.5">
-                      <Globe size={11} /> Histórico Global — Todas as Unidades
-                    </p>
-                  </div>
+                  <button onClick={() => setGlobalBoletim(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
+                    <XCircle size={20} className="text-white" />
+                  </button>
                 </div>
-                <button onClick={() => setGlobalBoletim(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
-                  <XCircle size={20} className="text-white" />
-                </button>
               </div>
-            </div>
 
-            {/* Body */}
-            <div className="p-6 overflow-y-auto flex-1">
-              {globalBoletim.loading ? (
-                <div className="py-16 flex flex-col items-center gap-4 text-slate-400">
-                  <Loader2 size={36} className="animate-spin text-indigo-500" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">Buscando notas em todas as unidades...</p>
-                  <p className="text-[9px] text-slate-400">Isso pode demorar alguns segundos</p>
-                </div>
-              ) : Object.keys(globalBoletim.resultados).length === 0 ? (
-                <div className="py-16 flex flex-col items-center text-slate-400">
-                  <BookCheck size={36} className="opacity-20 mb-3" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">Nenhuma nota encontrada em nenhuma unidade</p>
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  {/* Seletor de Ano — todos os anos de todas as unidades */}
-                  {(() => {
-                    const todosAnosData = {};
-                    Object.entries(globalBoletim.resultados).forEach(([uKey, uData]) => {
-                      Object.keys(uData.anos).forEach(ano => {
-                        if (!todosAnosData[ano]) todosAnosData[ano] = [];
-                        todosAnosData[ano].push(uData.unidadeNome.replace('UNIDADE ', 'U').replace(' - ÍCONE', '').trim());
+              {/* Body */}
+              <div className="p-6 overflow-y-auto flex-1">
+                {globalBoletim.loading ? (
+                  <div className="py-16 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={36} className="animate-spin text-indigo-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando notas em todas as unidades...</p>
+                    <p className="text-[9px] text-slate-400">Isso pode demorar alguns segundos</p>
+                  </div>
+                ) : Object.keys(globalBoletim.resultados).length === 0 ? (
+                  <div className="py-16 flex flex-col items-center text-slate-400">
+                    <BookCheck size={36} className="opacity-20 mb-3" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Nenhuma nota encontrada em nenhuma unidade</p>
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {/* Seletor de Ano — todos os anos de todas as unidades */}
+                    {(() => {
+                      const todosAnosData = {};
+                      Object.entries(globalBoletim.resultados).forEach(([uKey, uData]) => {
+                        Object.keys(uData.anos).forEach(ano => {
+                          if (!todosAnosData[ano]) todosAnosData[ano] = [];
+                          todosAnosData[ano].push(uData.unidadeNome.replace('UNIDADE ', 'U').replace(' - ÍCONE', '').trim());
+                        });
                       });
-                    });
 
-                    const todosAnos = Object.keys(todosAnosData).sort((a, b) => b.localeCompare(a));
+                      const todosAnos = Object.keys(todosAnosData).sort((a, b) => b.localeCompare(a));
 
-                    return (
-                      <div className="flex gap-2 flex-wrap border-b border-slate-100 pb-4">
-                        {todosAnos.map(ano => (
-                          <button
-                            key={ano}
-                            onClick={() => { setGlobalAnoBol(ano); setGlobalPeriodo('Todos'); }}
-                            className={`px-5 py-2 rounded-xl transition-all border text-left ${globalAnoBol === ano ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
-                          >
-                            <span className="font-black text-sm block leading-none mb-1">{ano}</span>
-                            <span className={`text-[8px] font-bold uppercase tracking-widest block ${globalAnoBol === ano ? 'text-indigo-200' : 'text-slate-400'}`}>
-                              {todosAnosData[ano].join(', ')}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    );
-                  })()}
-
-                  {/* Filtro de período */}
-                  {globalAnoBol && (() => {
-                    const todosPeriodos = new Set();
-                    Object.values(globalBoletim.resultados).forEach(u => {
-                      if (u.anos[globalAnoBol] && u.anos[globalAnoBol].disciplinas) {
-                        u.anos[globalAnoBol].disciplinas.forEach(d => todosPeriodos.add(d.nome));
-                      }
-                    });
-                    const periodos = Array.from(todosPeriodos).sort();
-                    return periodos.length > 0 ? (
-                      <div className="flex gap-2 flex-wrap">
-                        <button onClick={() => setGlobalPeriodo('Todos')} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === 'Todos' ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>Todos</button>
-                        {periodos.map(p => (
-                          <button key={p} onClick={() => setGlobalPeriodo(p)} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === p ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>{p}</button>
-                        ))}
-                      </div>
-                    ) : null;
-                  })()}
-
-                  {/* Resultados por unidade */}
-                  {globalAnoBol && Object.entries(globalBoletim.resultados).map(([uKey, uData]) => {
-                    if (!uData.anos[globalAnoBol]) return null;
-                    const { disciplinas, nomeTurma, temNotas } = uData.anos[globalAnoBol];
-                    const filtradas = disciplinas ? disciplinas.filter(d => globalPeriodo === 'Todos' || d.nome === globalPeriodo) : [];
-
-                    return (
-                      <div key={uKey} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                        <div className="bg-gradient-to-r from-indigo-50 to-slate-50 border-b border-slate-200 p-3 px-5 flex items-center justify-between">
-                          <h4 className="font-black text-indigo-900 uppercase tracking-widest text-xs flex items-center gap-2">
-                            <Building2 size={12} className="text-indigo-500" /> {uData.unidadeNome}
-                          </h4>
-                          {nomeTurma && (
-                            <span className="text-[9px] font-black uppercase tracking-widest text-indigo-400 bg-indigo-50 border border-indigo-100 px-2 py-1 rounded-lg">
-                              {nomeTurma}
-                            </span>
-                          )}
+                      return (
+                        <div className="flex gap-2 flex-wrap border-b border-slate-100 pb-4">
+                          {todosAnos.map(ano => (
+                            <button
+                              key={ano}
+                              onClick={() => { setGlobalAnoBol(ano); setGlobalPeriodo('Todos'); }}
+                              className={`px-5 py-2 rounded-xl transition-all border text-left ${globalAnoBol === ano ? 'bg-indigo-600 border-indigo-600 text-white shadow-md' : 'bg-slate-50 border-slate-200 text-slate-500 hover:bg-slate-100'}`}
+                            >
+                              <span className="font-black text-sm block leading-none mb-1">{ano}</span>
+                              <span className={`text-[8px] font-bold uppercase tracking-widest block ${globalAnoBol === ano ? 'text-indigo-200' : 'text-slate-400'}`}>
+                                {todosAnosData[ano].join(', ')}
+                              </span>
+                            </button>
+                          ))}
                         </div>
+                      );
+                    })()}
 
-                        {!temNotas || filtradas.length === 0 ? (
-                          <div className="p-8 text-center bg-white flex flex-col items-center">
-                            <BookCheck size={24} className="text-slate-200 mb-2" />
-                            <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Nenhuma nota lançada neste período</p>
+                    {/* Filtro de período */}
+                    {globalAnoBol && (() => {
+                      const todosPeriodos = new Set();
+                      Object.values(globalBoletim.resultados).forEach(u => {
+                        if (u.anos[globalAnoBol] && u.anos[globalAnoBol].disciplinas) {
+                          u.anos[globalAnoBol].disciplinas.forEach(d => todosPeriodos.add(d.nome));
+                        }
+                      });
+                      const periodos = Array.from(todosPeriodos).sort();
+                      return periodos.length > 0 ? (
+                        <div className="flex gap-2 flex-wrap">
+                          <button onClick={() => setGlobalPeriodo('Todos')} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === 'Todos' ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>Todos</button>
+                          {periodos.map(p => (
+                            <button key={p} onClick={() => setGlobalPeriodo(p)} className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalPeriodo === p ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}>{p}</button>
+                          ))}
+                        </div>
+                      ) : null;
+                    })()}
+
+                    {/* Resultados por unidade */}
+                    {globalAnoBol && Object.entries(globalBoletim.resultados).map(([uKey, uData]) => {
+                      if (!uData.anos[globalAnoBol]) return null;
+                      const { disciplinas, nomeTurma, temNotas } = uData.anos[globalAnoBol];
+                      const filtradas = disciplinas ? disciplinas.filter(d => globalPeriodo === 'Todos' || d.nome === globalPeriodo) : [];
+
+                      return (
+                        <div key={uKey} className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
+                          <div className="bg-gradient-to-r from-indigo-50 to-slate-50 border-b border-slate-200 p-3 px-5 flex items-center justify-between">
+                            <h4 className="font-black text-indigo-900 uppercase tracking-widest text-xs flex items-center gap-2">
+                              <Building2 size={12} className="text-indigo-500" /> {uData.unidadeNome}
+                            </h4>
+                            {nomeTurma && (
+                              <span className="text-[9px] font-black uppercase tracking-widest text-indigo-400 bg-indigo-50 border border-indigo-100 px-2 py-1 rounded-lg">
+                                {nomeTurma}
+                              </span>
+                            )}
                           </div>
-                        ) : (
-                          <div className="divide-y divide-slate-100 bg-white">
-                            {filtradas.map((d, i) => (
-                              <div key={i} className="p-3 px-5 flex items-center justify-between hover:bg-slate-50 transition-colors">
-                                <span className="text-xs font-bold text-slate-700 uppercase">
-                                  {d.disciplina}
-                                  <span className="font-normal ml-2 text-[9px] text-slate-400 tracking-widest">({d.nome})</span>
-                                </span>
-                                <div className="flex flex-col items-end gap-1">
-                                  <span className="font-black text-indigo-600 w-14 text-center bg-indigo-50 p-1.5 rounded-lg border border-indigo-100 text-sm">{d.notaFinal}</span>
-                                  {d.subNotas && d.subNotas.length > 0 && (
-                                    <div className="flex gap-1.5 flex-wrap justify-end">
-                                      {d.subNotas.map((sn, idx) => (
-                                        <span key={idx} className="bg-slate-100 text-slate-500 font-bold text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-slate-200">
-                                          {sn.nome}: <span className="text-slate-700">{sn.nota}</span>
-                                        </span>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
 
-      {/* MODAL DE DETALHES */}
-      {selectedAlunoDetails && (
-
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setSelectedAlunoDetails(null)}>
-          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
-            <div className="bg-slate-900 p-6 text-white relative overflow-hidden">
-              <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
-
-              <div className="relative z-10 flex items-start justify-between">
-                <div className="flex items-center gap-4">
-                  <div className={`w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg ${selectedAlunoDetails.material?.comprou ? 'bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-slate-700 text-slate-400'}`}>
-                    {selectedAlunoDetails.nome.charAt(0)}
-                  </div>
-                  <div>
-                    <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{selectedAlunoDetails.nome}</h3>
-                    <p className="text-slate-400 text-xs font-bold uppercase tracking-widest mt-1">Detalhes do Aluno</p>
-                  </div>
-                </div>
-                <button onClick={() => setSelectedAlunoDetails(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
-                  <XCircle size={20} className="text-white" />
-                </button>
-              </div>
-            </div>
-
-            <div className="p-6">
-              {selectedAlunoDetails.loading ? (
-                <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
-                  <Loader2 size={32} className="animate-spin text-orange-500" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">Buscando Informações...</p>
-                </div>
-              ) : selectedAlunoDetails.error ? (
-                <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">
-                  {selectedAlunoDetails.error}
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5"><User size={10} /> Matrícula</p>
-                      <p className="font-bold text-slate-700 text-sm">{selectedAlunoDetails.matricula}</p>
-                    </div>
-                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
-                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5"><Calendar size={10} /> Nascimento</p>
-                      <p className="font-bold text-slate-700 text-sm">{selectedAlunoDetails.dataNascimento}</p>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
-                    <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-orange-100 transition-colors group">
-                      <div className="w-10 h-10 rounded-xl bg-orange-50 flex items-center justify-center text-orange-500 group-hover:bg-orange-500 group-hover:text-white transition-colors">
-                        <User size={18} />
-                      </div>
-                      <div>
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">CPF</p>
-                        <p className="font-bold text-slate-700 font-mono text-sm">{selectedAlunoDetails.cpf}</p>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 transition-colors group">
-                      <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-500 group-hover:bg-blue-500 group-hover:text-white transition-colors">
-                        <div className="scale-75"><User size={20} /></div>
-                      </div>
-                      <div className="overflow-hidden">
-                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Email</p>
-                        <p className="font-bold text-slate-700 text-sm truncate w-full">{selectedAlunoDetails.email}</p>
-                      </div>
-                    </div>
-
-                    {selectedAlunoDetails.responsavel && (
-                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100">
-                        <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500">
-                          <Users size={18} />
-                        </div>
-                        <div>
-                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5">Responsável</p>
-                          <p className="font-bold text-slate-700 text-sm">{selectedAlunoDetails.responsavel}</p>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL DE BOLETIM */}
-      {selectedBoletim && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setSelectedBoletim(null)}>
-          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-2xl overflow-hidden animate-in zoom-in-95 duration-200" onClick={e => e.stopPropagation()}>
-            <div className="bg-indigo-900 p-6 text-white relative overflow-hidden">
-              <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
-
-              <div className="relative z-10 flex items-start justify-between">
-                <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg bg-indigo-500 text-white shadow-lg shadow-indigo-900/20">
-                    {selectedBoletim.aluno.nome.charAt(0)}
-                  </div>
-                  <div>
-                    <h3 className="font-black text-lg uppercase tracking-tight leading-tight">{selectedBoletim.aluno.nome}</h3>
-                    <p className="text-indigo-200 text-xs font-bold uppercase tracking-widest mt-1">Histórico de Notas</p>
-                  </div>
-                </div>
-                <button onClick={() => setSelectedBoletim(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
-                  <XCircle size={20} className="text-white" />
-                </button>
-              </div>
-            </div>
-
-            <div className="p-6 max-h-[70vh] overflow-y-auto">
-              {selectedBoletim.loading ? (
-                <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
-                  <Loader2 size={32} className="animate-spin text-indigo-500" />
-                  <p className="text-[10px] font-black uppercase tracking-widest">Buscando Notas...</p>
-                </div>
-              ) : selectedBoletim.error ? (
-                <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">
-                  {selectedBoletim.error}
-                </div>
-              ) : !selectedBoletim.anos ? (
-                <div className="py-12 flex flex-col items-center text-slate-400 px-6">
-                  <BookCheck size={32} className="opacity-20 mb-3" />
-                  {selectedBoletim.anosEncontrados?.length > 0 ? (
-                    <>
-                      <p className="text-[10px] font-black uppercase tracking-widest text-center">
-                        Matrículas anteriores encontradas, mas sem notas no sistema
-                      </p>
-                      <p className="text-[9px] text-slate-400 mt-2 text-center">
-                        Anos consultados: {selectedBoletim.anosEncontrados.join(', ')}
-                      </p>
-                      <p className="text-[9px] text-orange-400 mt-1 text-center font-bold uppercase tracking-widest">
-                        As notas não foram lançadas no Sponte para esses períodos
-                      </p>
-                    </>
-                  ) : (
-                    <p className="text-[10px] font-black uppercase tracking-widest">Nenhuma matrícula anterior encontrada</p>
-                  )}
-                </div>
-              ) : (
-                <div className="space-y-6">
-                  {(() => {
-                    const anosOrdenados = Object.keys(selectedBoletim.anos).sort((a, b) => b.localeCompare(a));
-                    return (
-                      <div className="flex gap-2 mb-4 border-b border-slate-200 pb-2">
-                        {anosOrdenados.map(ano => (
-                          <button
-                            key={ano}
-                            onClick={() => {
-                              setSelectedAnoBoletim(ano);
-                              setSelectedPeriodo('Todos');
-                              setSelectedDisciplinasExport(new Set());
-                            }}
-                            className={`px-5 py-2.5 rounded-t-xl text-xs font-black uppercase tracking-widest transition-all ${selectedAnoBoletim === ano ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-50 text-slate-500 hover:bg-slate-100 border border-transparent hover:border-slate-200'}`}
-                          >
-                            Ano {ano}
-                          </button>
-                        ))}
-                      </div>
-                    );
-                  })()}
-
-                  {selectedAnoBoletim && selectedBoletim.anos[selectedAnoBoletim] && (() => {
-                    const disciplinasAno = selectedBoletim.anos[selectedAnoBoletim];
-                    const todosPeriodos = new Set();
-                    disciplinasAno.forEach(d => todosPeriodos.add(d.nome));
-                    const periodosOrdenados = Array.from(todosPeriodos).sort();
-
-                    return (
-                      <div className="flex gap-2 mb-2 flex-wrap">
-                        <button
-                          onClick={() => setSelectedPeriodo('Todos')}
-                          className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${selectedPeriodo === 'Todos' ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
-                        >
-                          Todos os Períodos
-                        </button>
-                        {periodosOrdenados.map(p => (
-                          <button
-                            key={p}
-                            onClick={() => setSelectedPeriodo(p)}
-                            className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${selectedPeriodo === p ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
-                          >
-                            {p}
-                          </button>
-                        ))}
-                      </div>
-                    );
-                  })()}
-
-                  {selectedAnoBoletim && selectedBoletim.anos[selectedAnoBoletim] && (
-                    <>
-                      <div className="flex items-center justify-between bg-slate-50 p-3 rounded-2xl border border-slate-100">
-                        <button
-                          onClick={() => {
-                            const allVisibleIds = new Set();
-                            selectedBoletim.anos[selectedAnoBoletim].forEach(d => {
-                              if (selectedPeriodo === 'Todos' || d.nome === selectedPeriodo) {
-                                allVisibleIds.add(d.id);
-                              }
-                            });
-
-                            let allSelected = true;
-                            for (let id of allVisibleIds) {
-                              if (!selectedDisciplinasExport.has(id)) {
-                                allSelected = false;
-                                break;
-                              }
-                            }
-
-                            if (allSelected && allVisibleIds.size > 0) {
-                              setSelectedDisciplinasExport(new Set());
-                            } else {
-                              setSelectedDisciplinasExport(allVisibleIds);
-                            }
-                          }}
-                          className="text-[10px] font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-800 flex items-center gap-1.5 transition-colors px-2 py-1"
-                        >
-                          <CheckCircle size={14} /> Selecionar Visíveis
-                        </button>
-
-                        <button
-                          onClick={() => {
-                            if (!selectedBoletim || !selectedBoletim.anos || selectedDisciplinasExport.size === 0) return;
-
-                            const dataToExport = [];
-                            selectedBoletim.anos[selectedAnoBoletim].forEach(d => {
-                              if (selectedDisciplinasExport.has(d.id)) {
-                                const row = {
-                                  'Ano Letivo': selectedAnoBoletim,
-                                  'Período': d.nome,
-                                  'Disciplina': d.disciplina,
-                                  'Média Final': d.notaFinal,
-                                };
-
-                                if (d.subNotas) {
-                                  d.subNotas.forEach(sn => {
-                                    row[`Nota Parcial - ${sn.nome}`] = sn.nota;
-                                  });
-                                }
-                                dataToExport.push(row);
-                              }
-                            });
-
-                            const ws = XLSX.utils.json_to_sheet(dataToExport);
-                            const wb = XLSX.utils.book_new();
-                            XLSX.utils.book_append_sheet(wb, ws, `Notas ${selectedAnoBoletim}`);
-                            XLSX.writeFile(wb, `Boletim_${selectedAnoBoletim}_${selectedBoletim.aluno.nome.replace(/\s+/g, '_')}_${new Date().getTime()}.xlsx`);
-                          }}
-                          disabled={selectedDisciplinasExport.size === 0}
-                          className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 transition-all ${selectedDisciplinasExport.size > 0 ? 'bg-green-600 text-white shadow-md shadow-green-600/20 hover:bg-green-500 hover:-translate-y-0.5' : 'bg-slate-200 text-slate-400 cursor-not-allowed opacity-50'}`}
-                        >
-                          <FileSpreadsheet size={15} /> Baixar {selectedDisciplinasExport.size} Selecionadas
-                        </button>
-                      </div>
-
-                      {(() => {
-                        const disciplinasFiltradas = selectedBoletim.anos[selectedAnoBoletim].filter(d => selectedPeriodo === 'Todos' || d.nome === selectedPeriodo);
-                        if (disciplinasFiltradas.length === 0) return null;
-
-                        return (
-                          <div className="border border-slate-200 rounded-2xl overflow-hidden shadow-sm">
-                            <div className="bg-slate-50 border-b border-slate-200 p-3 px-5">
-                              <h4 className="font-black text-indigo-900 uppercase tracking-widest text-xs flex items-center gap-2">
-                                <Calendar size={14} className="text-indigo-500" /> Ano Letivo {selectedAnoBoletim}
-                              </h4>
+                          {!temNotas || filtradas.length === 0 ? (
+                            <div className="p-8 text-center bg-white flex flex-col items-center">
+                              <BookCheck size={24} className="text-slate-200 mb-2" />
+                              <p className="text-[10px] uppercase tracking-widest font-black text-slate-400">Nenhuma nota lançada neste período</p>
                             </div>
-                            <div className="divide-y divide-slate-100">
-                              {disciplinasFiltradas.map((d, i) => (
-                                <div key={i} className={`p-3 px-5 flex items-center justify-between transition-colors border-l-2 ${selectedDisciplinasExport.has(d.id) ? 'bg-indigo-50/30 border-indigo-500' : 'hover:bg-slate-50 border-transparent'}`}>
-                                  <div className="flex items-center gap-3">
-                                    <button
-                                      onClick={() => {
-                                        setSelectedDisciplinasExport(prev => {
-                                          const next = new Set(prev);
-                                          if (next.has(d.id)) next.delete(d.id);
-                                          else next.add(d.id);
-                                          return next;
-                                        });
-                                      }}
-                                      className={`w-5 h-5 rounded flex items-center justify-center border transition-all flex-shrink-0 ${selectedDisciplinasExport.has(d.id) ? 'bg-indigo-600 border-indigo-600 text-white shadow-sm' : 'border-slate-300 hover:border-indigo-400 bg-white cursor-pointer'}`}
-                                    >
-                                      {selectedDisciplinasExport.has(d.id) && <CheckCircle size={14} className="stroke-[3px]" />}
-                                    </button>
-                                    <span className={`text-xs font-bold uppercase transition-colors ${selectedDisciplinasExport.has(d.id) ? 'text-indigo-900' : 'text-slate-700'}`}>
-                                      {d.disciplina} <span className={`font-normal ml-2 tracking-widest text-[9px] ${selectedDisciplinasExport.has(d.id) ? 'text-indigo-400/80' : 'text-slate-400'}`}>({d.nome})</span>
-                                    </span>
-                                  </div>
-                                  <div className="flex flex-col gap-1 items-end">
-                                    <div className="flex items-center gap-4">
-                                      <span className="font-black text-indigo-600 w-16 text-center bg-indigo-50/50 p-1.5 rounded-lg border border-indigo-100/50" title="Média do Período">
-                                        {d.notaFinal}
-                                      </span>
-                                    </div>
+                          ) : (
+                            <div className="divide-y divide-slate-100 bg-white">
+                              {filtradas.map((d, i) => (
+                                <div key={i} className="p-3 px-5 flex items-center justify-between hover:bg-slate-50 transition-colors">
+                                  <span className="text-xs font-bold text-slate-700 uppercase">
+                                    {d.disciplina}
+                                    <span className="font-normal ml-2 text-[9px] text-slate-400 tracking-widest">({d.nome})</span>
+                                  </span>
+                                  <div className="flex flex-col items-end gap-1">
+                                    <span className="font-black text-indigo-600 w-14 text-center bg-indigo-50 p-1.5 rounded-lg border border-indigo-100 text-sm">{d.notaFinal}</span>
                                     {d.subNotas && d.subNotas.length > 0 && (
-                                      <div className="flex gap-1.5 justify-end mt-1 flex-wrap">
+                                      <div className="flex gap-1.5 flex-wrap justify-end">
                                         {d.subNotas.map((sn, idx) => (
                                           <span key={idx} className="bg-slate-100 text-slate-500 font-bold text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-slate-200">
                                             {sn.nome}: <span className="text-slate-700">{sn.nota}</span>
@@ -1679,101 +1692,494 @@ const App = () => {
                                 </div>
                               ))}
                             </div>
-                          </div>
-                        );
-                      })()}
-                    </>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      <div className="max-w-[1400px] mx-auto flex flex-col lg:flex-row gap-8 items-start">
-        <div className="flex-1 space-y-8 w-full min-w-0">
-          {/* TABS DE NAVEGAÇÃO */}
-          <div className="flex bg-white/50 backdrop-blur border border-slate-200 p-1.5 rounded-2xl w-fit mx-auto shadow-sm">
-            <button
-              onClick={() => { setViewMode('auditoria'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
-              className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'auditoria' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-500 hover:text-orange-600 hover:bg-slate-100'}`}
-            >
-              <BookCheck size={16} /> Auditoria Material
-            </button>
-            <button
-              onClick={() => { setViewMode('notas'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
-              className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'notas' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-500 hover:text-orange-600 hover:bg-slate-100'}`}
-            >
-              <GraduationCap size={16} /> Consulta de Dados
-            </button>
-          </div>
-
-          {viewMode === 'welcome' && (
-            <div className="bg-white rounded-[2rem] shadow-sm border border-slate-200 p-12 text-center flex flex-col items-center justify-center min-h-[50vh] animate-in fade-in zoom-in-95 duration-500">
-              <div className="w-24 h-24 bg-orange-50 rounded-full flex items-center justify-center mb-6">
-                <School size={48} className="text-orange-500" />
-              </div>
-              <h1 className="text-3xl font-black text-slate-800 uppercase tracking-tight mb-4">Bem-vindo ao Sistema</h1>
-              <p className="text-slate-500 max-w-md font-medium text-sm">
-                Selecione uma das guias acima para iniciar. Você pode realizar a Auditoria de Material ou consultar o Histórico de Notas dos alunos.
-              </p>
-            </div>
-          )}
-
-          {viewMode !== 'welcome' && (
-            <>
-              <div className="bg-slate-900 rounded-[2rem] shadow-2xl relative overflow-hidden group animate-in fade-in duration-300">
-                {/* Efeito Glass decorativo */}
-                <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 pointer-events-none transition-colors duration-700 group-hover:bg-orange-500/10"></div>
-
-                <div className="p-8 md:p-12 text-white relative z-10">
-                  <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-8">
-                    <div className="flex items-center gap-6">
-                      <div className="p-5 bg-white/10 rounded-2xl backdrop-blur-md border border-white/10 shadow-inner">
-                        {viewMode === 'auditoria' ? <BookCheck size={40} className="text-orange-400" /> : <GraduationCap size={40} className="text-orange-400" />}
-                      </div>
-                      <div>
-                        <h1 className="text-3xl font-black uppercase tracking-tight leading-none mb-2">
-                          {viewMode === 'auditoria' ? 'Auditoria Material 2026' : 'Histórico Acadêmico 2026'}
-                        </h1>
-                        <div className="flex items-center gap-2">
-                          <span className="w-1.5 h-1.5 rounded-full animate-pulse bg-orange-500"></span>
-                          <p className="text-slate-400 text-xs font-bold uppercase tracking-[0.2em]">
-                            {viewMode === 'auditoria' ? 'Verificação Financeira Individual (Pente-Fino)' : 'Consulta de Veteranos e Boletins Passados'}
-                          </p>
+                          )}
                         </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* MODAL DE DETALHES */}
+      {
+        selectedAlunoDetails && (
+
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setSelectedAlunoDetails(null)}>
+            <div className="bg-white dark:bg-slate-950 rounded-[2rem] shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200 border border-white/10 dark:border-slate-800/50" onClick={e => e.stopPropagation()}>
+              <div className={`p-6 relative overflow-hidden transition-all border-b ${isDarkMode ? 'bg-black text-white border-slate-800' : 'bg-slate-50 text-slate-900 border-slate-100'}`}>
+                <div className="absolute top-0 right-0 w-32 h-32 bg-orange-500/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
+
+                <div className="relative z-10 flex items-start justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className={`w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg transition-all ${selectedAlunoDetails.material?.comprou ? 'bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 border border-slate-300 dark:border-slate-700'}`}>
+                      {selectedAlunoDetails.nome.charAt(0)}
+                    </div>
+                    <div
+                      className="cursor-pointer group/name relative"
+                      onClick={() => {
+                        navigator.clipboard.writeText(selectedAlunoDetails.nome);
+                        setCopiedField('nome_details');
+                        setTimeout(() => setCopiedField(null), 2000);
+                      }}
+                    >
+                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight group-hover/name:text-orange-500 transition-colors flex items-center gap-2">
+                        {selectedAlunoDetails.nome}
+                        {copiedField === 'nome_details' && (
+                          <span className="bg-orange-500 text-white text-[8px] px-1.5 py-0.5 rounded uppercase font-black tracking-widest animate-in fade-in zoom-in duration-200">
+                            Copiado!
+                          </span>
+                        )}
+                      </h3>
+                      <p className="text-slate-500 dark:text-slate-500 text-xs font-bold uppercase tracking-widest mt-1 transition-colors">
+                        Detalhes do Aluno • Clique para copiar
+                      </p>
+                    </div>
+                  </div>
+                  <button onClick={() => setSelectedAlunoDetails(null)} className="p-2 bg-slate-200/50 dark:bg-white/10 rounded-xl hover:bg-slate-200 dark:hover:bg-white/20 transition-colors">
+                    <XCircle size={20} className="text-slate-400 dark:text-white" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6">
+                {selectedAlunoDetails.loading ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando Informações...</p>
+                  </div>
+                ) : selectedAlunoDetails.error ? (
+                  <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">
+                    {selectedAlunoDetails.error}
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div
+                        className="p-4 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 transition-all cursor-pointer hover:border-orange-200 dark:hover:border-orange-800 group/field"
+                        onClick={() => {
+                          navigator.clipboard.writeText(selectedAlunoDetails.matricula || '');
+                          setCopiedField('matricula_details');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-1.5"><User size={10} /> Matrícula</p>
+                          {copiedField === 'matricula_details' && <CheckCircle size={11} className="text-green-500 animate-in zoom-in duration-200" />}
+                        </div>
+                        <p className="font-bold text-slate-700 dark:text-slate-200 text-sm group-hover/field:text-orange-600 transition-colors">{selectedAlunoDetails.matricula}</p>
+                      </div>
+                      <div
+                        className="p-4 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 transition-all cursor-pointer hover:border-orange-200 dark:hover:border-orange-800 group/field"
+                        onClick={() => {
+                          navigator.clipboard.writeText(selectedAlunoDetails.dataNascimento || '');
+                          setCopiedField('nasc_details');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="flex items-center justify-between mb-1">
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest flex items-center gap-1.5"><Calendar size={10} /> Nascimento</p>
+                          {copiedField === 'nasc_details' && <CheckCircle size={11} className="text-green-500 animate-in zoom-in duration-200" />}
+                        </div>
+                        <p className="font-bold text-slate-700 dark:text-slate-200 text-sm group-hover/field:text-orange-600 transition-colors">{selectedAlunoDetails.dataNascimento}</p>
                       </div>
                     </div>
 
-                    <div className="bg-slate-800/80 p-1.5 pl-5 rounded-2xl flex flex-col gap-1 backdrop-blur-sm border border-white/5 min-w-[300px] shadow-xl">
-                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1.5 mt-2">
+                    <div className="space-y-4">
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-orange-100 dark:hover:border-orange-900 transition-colors group cursor-pointer"
+                        onClick={() => {
+                          navigator.clipboard.writeText(selectedAlunoDetails.cpf || '');
+                          setCopiedField('cpf_details');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="w-10 h-10 rounded-xl bg-orange-50 dark:bg-orange-900/20 flex items-center justify-center text-orange-500 dark:text-orange-400 group-hover:bg-orange-500 group-hover:text-white transition-colors">
+                          <User size={18} />
+                        </div>
+                        <div className="flex-1">
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            CPF
+                            {copiedField === 'cpf_details' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 dark:text-slate-200 font-mono text-sm group-hover:text-orange-600 transition-colors">{selectedAlunoDetails.cpf}</p>
+                        </div>
+                      </div>
+
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-blue-100 dark:hover:border-blue-900 transition-colors group cursor-pointer"
+                        onClick={() => {
+                          navigator.clipboard.writeText(selectedAlunoDetails.email || '');
+                          setCopiedField('email_details');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-blue-900/20 flex items-center justify-center text-blue-500 dark:text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-colors">
+                          <div className="scale-75"><User size={20} /></div>
+                        </div>
+                        <div className="overflow-hidden flex-1">
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            Email
+                            {copiedField === 'email_details' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 dark:text-slate-200 text-sm truncate w-full group-hover:text-blue-600 transition-colors">{selectedAlunoDetails.email}</p>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 transition-colors">
+                        <div className="w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-500 dark:text-slate-400">
+                          <LayoutList size={18} />
+                        </div>
+                        <div>
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Turma Atual</p>
+                          <p className="font-bold text-slate-700 dark:text-slate-200 text-sm">{selectedAlunoDetails.turma}</p>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      {/* MODAL DE BOLETIM */}
+      {
+        selectedBoletim && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setSelectedBoletim(null)}>
+            <div className="bg-white dark:bg-slate-950 rounded-[2rem] shadow-2xl w-full max-w-2xl overflow-hidden animate-in zoom-in-95 duration-200 border border-white/10 dark:border-slate-800/50" onClick={e => e.stopPropagation()}>
+              <div className={`p-6 relative overflow-hidden transition-all border-b ${isDarkMode ? 'bg-black text-white border-slate-800' : 'bg-slate-50 text-slate-900 border-slate-100'}`}>
+                <div className="absolute top-0 right-0 w-32 h-32 bg-indigo-500/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
+
+                <div className="relative z-10 flex items-start justify-between">
+                  <div className="flex items-center gap-4">
+                    <div className="w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg bg-indigo-600 dark:bg-indigo-500 text-white shadow-lg shadow-indigo-600/20 dark:shadow-indigo-900/20">
+                      {selectedBoletim.aluno.nome.charAt(0)}
+                    </div>
+                    <div
+                      className="cursor-pointer group/name relative"
+                      onClick={() => {
+                        navigator.clipboard.writeText(selectedBoletim.aluno.nome);
+                        const el = document.getElementById('copy-feedback-boletim');
+                        if (el) {
+                          el.style.opacity = '1';
+                          setTimeout(() => el.style.opacity = '0', 2000);
+                        }
+                      }}
+                    >
+                      <h3 className="font-black text-lg uppercase tracking-tight leading-tight group-hover/name:text-indigo-500 transition-colors flex items-center gap-2">
+                        {selectedBoletim.aluno.nome}
+                        <span id="copy-feedback-boletim" className="opacity-0 transition-opacity bg-indigo-500 text-white text-[8px] px-1.5 py-0.5 rounded uppercase font-black tracking-widest">Copiado!</span>
+                      </h3>
+                      <p className="text-indigo-600 dark:text-indigo-400 text-xs font-bold uppercase tracking-widest mt-1">Histórico de Notas • Clique no nome para copiar</p>
+                    </div>
+                  </div>
+                  <button onClick={() => setSelectedBoletim(null)} className="p-2 bg-slate-200/50 dark:bg-white/10 rounded-xl hover:bg-slate-200 dark:hover:bg-white/20 transition-colors">
+                    <XCircle size={20} className="text-slate-400 dark:text-white" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 max-h-[70vh] overflow-y-auto">
+                {selectedBoletim.loading ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400 dark:text-slate-600">
+                    <Loader2 size={32} className="animate-spin text-indigo-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando Notas...</p>
+                  </div>
+                ) : selectedBoletim.error ? (
+                  <div className="p-4 bg-red-50 dark:bg-red-900/10 text-red-600 dark:text-red-400 rounded-xl text-xs font-bold text-center border border-red-100 dark:border-red-900/20">
+                    {selectedBoletim.error}
+                  </div>
+                ) : !selectedBoletim.anos ? (
+                  <div className="py-12 flex flex-col items-center text-slate-400 dark:text-slate-600 px-6">
+                    <BookCheck size={32} className="opacity-20 mb-3" />
+                    {selectedBoletim.anosEncontrados?.length > 0 ? (
+                      <>
+                        <p className="text-[10px] font-black uppercase tracking-widest text-center">
+                          Matrículas anteriores encontradas, mas sem notas no sistema
+                        </p>
+                        <p className="text-[9px] text-slate-400 dark:text-slate-500 mt-2 text-center">
+                          Anos consultados: {selectedBoletim.anosEncontrados.join(', ')}
+                        </p>
+                        <p className="text-[9px] text-orange-400 dark:text-orange-500 mt-1 text-center font-bold uppercase tracking-widest">
+                          As notas não foram lançadas no Sponte para esses períodos
+                        </p>
+                      </>
+                    ) : (
+                      <p className="text-[10px] font-black uppercase tracking-widest">Nenhuma matrícula anterior encontrada</p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="space-y-6">
+                    {(() => {
+                      const anosOrdenados = Object.keys(selectedBoletim.anos).sort((a, b) => b.localeCompare(a));
+                      return (
+                        <div className="flex gap-2 mb-4 border-b border-slate-200 dark:border-slate-800 pb-2">
+                          {anosOrdenados.map(ano => (
+                            <button
+                              key={ano}
+                              onClick={() => {
+                                setSelectedAnoBoletim(ano);
+                                setSelectedPeriodo('Todos');
+                                setSelectedDisciplinasExport(new Set());
+                              }}
+                              className={`px-5 py-2.5 rounded-t-xl text-xs font-black uppercase tracking-widest transition-all ${selectedAnoBoletim === ano ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-50 dark:bg-slate-900 text-slate-500 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 border border-transparent hover:border-slate-200 dark:hover:border-slate-700'}`}
+                            >
+                              Ano {ano}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
+
+                    {selectedAnoBoletim && selectedBoletim.anos[selectedAnoBoletim] && (() => {
+                      const disciplinasAno = selectedBoletim.anos[selectedAnoBoletim];
+                      const todosPeriodos = new Set();
+                      disciplinasAno.forEach(d => todosPeriodos.add(d.nome));
+                      const periodosOrdenados = Array.from(todosPeriodos).sort();
+
+                      return (
+                        <div className="flex gap-2 mb-2 flex-wrap">
+                          <button
+                            onClick={() => setSelectedPeriodo('Todos')}
+                            className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${selectedPeriodo === 'Todos' ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'}`}
+                          >
+                            <LayoutGrid size={12} /> Todos os Períodos
+                          </button>
+                          {periodosOrdenados.map(p => (
+                            <button
+                              key={p}
+                              onClick={() => setSelectedPeriodo(p)}
+                              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${selectedPeriodo === p ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200' : 'bg-slate-100 dark:bg-slate-900 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-800'}`}
+                            >
+                              {p}
+                            </button>
+                          ))}
+                        </div>
+                      );
+                    })()}
+
+                    {selectedAnoBoletim && selectedBoletim.anos[selectedAnoBoletim] && (
+                      <>
+                        <div className="flex items-center justify-between bg-slate-50 dark:bg-slate-900/50 p-3 rounded-2xl border border-slate-100 dark:border-slate-800 transition-colors">
+                          <button
+                            onClick={() => {
+                              const allVisibleIds = new Set();
+                              selectedBoletim.anos[selectedAnoBoletim].forEach(d => {
+                                if (selectedPeriodo === 'Todos' || d.nome === selectedPeriodo) {
+                                  allVisibleIds.add(d.id);
+                                }
+                              });
+
+                              let allSelected = true;
+                              for (let id of allVisibleIds) {
+                                if (!selectedDisciplinasExport.has(id)) {
+                                  allSelected = false;
+                                  break;
+                                }
+                              }
+
+                              if (allSelected && allVisibleIds.size > 0) {
+                                setSelectedDisciplinasExport(new Set());
+                              } else {
+                                setSelectedDisciplinasExport(allVisibleIds);
+                              }
+                            }}
+                            className="text-[10px] font-black uppercase tracking-widest text-indigo-600 dark:text-indigo-400 hover:text-indigo-800 dark:hover:text-indigo-300 flex items-center gap-1.5 transition-colors px-2 py-1"
+                          >
+                            <CheckCircle size={14} /> Selecionar Visíveis
+                          </button>
+
+                          <button
+                            onClick={() => {
+                              if (!selectedBoletim || !selectedBoletim.anos || selectedDisciplinasExport.size === 0) return;
+
+                              const dataToExport = [];
+                              selectedBoletim.anos[selectedAnoBoletim].forEach(d => {
+                                if (selectedDisciplinasExport.has(d.id)) {
+                                  const row = {
+                                    'Ano Letivo': selectedAnoBoletim,
+                                    'Período': d.nome,
+                                    'Disciplina': d.disciplina,
+                                    'Média Final': d.notaFinal,
+                                  };
+
+                                  if (d.subNotas) {
+                                    d.subNotas.forEach(sn => {
+                                      row[`Nota Parcial - ${sn.nome}`] = sn.nota;
+                                    });
+                                  }
+                                  dataToExport.push(row);
+                                }
+                              });
+
+                              const ws = XLSX.utils.json_to_sheet(dataToExport);
+                              const wb = XLSX.utils.book_new();
+                              XLSX.utils.book_append_sheet(wb, ws, `Notas ${selectedAnoBoletim}`);
+                              XLSX.writeFile(wb, `Boletim_${selectedAnoBoletim}_${selectedBoletim.aluno.nome.replace(/\s+/g, '_')}_${new Date().getTime()}.xlsx`);
+                            }}
+                            disabled={selectedDisciplinasExport.size === 0}
+                            className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest flex items-center gap-2 transition-all ${selectedDisciplinasExport.size > 0 ? 'bg-green-600 text-white shadow-md shadow-green-600/20 hover:bg-green-500 hover:-translate-y-0.5' : 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-600 cursor-not-allowed opacity-50'}`}
+                          >
+                            <FileSpreadsheet size={15} /> Baixar {selectedDisciplinasExport.size} Selecionadas
+                          </button>
+                        </div>
+
+                        {(() => {
+                          const disciplinasFiltradas = selectedBoletim.anos[selectedAnoBoletim].filter(d => selectedPeriodo === 'Todos' || d.nome === selectedPeriodo);
+                          if (disciplinasFiltradas.length === 0) return null;
+
+                          return (
+                            <div className="border border-slate-200 dark:border-slate-800 rounded-2xl overflow-hidden shadow-sm transition-colors">
+                              <div className="bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-800 p-3 px-5">
+                                <h4 className="font-black text-indigo-900 dark:text-indigo-300 uppercase tracking-widest text-xs flex items-center gap-2">
+                                  <Calendar size={14} className="text-indigo-500 dark:text-indigo-400" /> Ano Letivo {selectedAnoBoletim}
+                                </h4>
+                              </div>
+                              <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                                {disciplinasFiltradas.map((d, i) => (
+                                  <div key={i} className={`p-3 px-5 flex items-center justify-between transition-colors border-l-2 ${selectedDisciplinasExport.has(d.id) ? 'bg-indigo-50/20 dark:bg-indigo-900/10 border-indigo-500' : 'hover:bg-slate-50 dark:hover:bg-slate-800/50 border-transparent'}`}>
+                                    <div className="flex items-center gap-3">
+                                      <button
+                                        onClick={() => {
+                                          setSelectedDisciplinasExport(prev => {
+                                            const next = new Set(prev);
+                                            if (next.has(d.id)) next.delete(d.id);
+                                            else next.add(d.id);
+                                            return next;
+                                          });
+                                        }}
+                                        className={`w-5 h-5 rounded flex items-center justify-center border transition-all flex-shrink-0 ${selectedDisciplinasExport.has(d.id) ? 'bg-indigo-600 border-indigo-600 text-white shadow-sm' : 'border-slate-300 dark:border-slate-700 hover:border-indigo-400 dark:hover:border-indigo-500 bg-white dark:bg-slate-800 cursor-pointer'}`}
+                                      >
+                                        {selectedDisciplinasExport.has(d.id) && <CheckCircle size={14} className="stroke-[3px]" />}
+                                      </button>
+                                      <span className={`text-xs font-bold uppercase transition-colors ${selectedDisciplinasExport.has(d.id) ? 'text-indigo-900 dark:text-indigo-100' : 'text-slate-700 dark:text-slate-300'}`}>
+                                        {d.disciplina} <span className={`font-normal ml-2 tracking-widest text-[9px] ${selectedDisciplinasExport.has(d.id) ? 'text-indigo-400/80' : 'text-slate-400 dark:text-slate-500'}`}>({d.nome})</span>
+                                      </span>
+                                    </div>
+                                    <div className="flex flex-col gap-1 items-end">
+                                      <div className="flex items-center gap-4">
+                                        <span className="font-black text-indigo-600 dark:text-indigo-400 w-16 text-center bg-indigo-50/50 dark:bg-indigo-900/20 p-1.5 rounded-lg border border-indigo-100/50 dark:border-indigo-800/50" title="Média do Período">
+                                          {d.notaFinal}
+                                        </span>
+                                      </div>
+                                      {d.subNotas && d.subNotas.length > 0 && (
+                                        <div className="flex gap-1.5 justify-end mt-1 flex-wrap">
+                                          {d.subNotas.map((sn, idx) => (
+                                            <span key={idx} className="bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 font-bold text-[9px] px-1.5 py-0.5 rounded-md uppercase tracking-widest border border-slate-200 dark:border-slate-700">
+                                              {sn.nome}: <span className="text-slate-700 dark:text-slate-300">{sn.nota}</span>
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })()}
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )
+      }
+
+      <div className="max-w-[1400px] mx-auto space-y-8 w-full min-w-0">
+        {/* TABS DE NAVEGAÇÃO */}
+        <div className={`flex backdrop-blur border p-1.5 rounded-2xl w-fit mx-auto shadow-sm transition-all ${isDarkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-slate-200/50 border-slate-300'}`}>
+          <button
+            onClick={() => { setViewMode('auditoria'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
+            className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'auditoria' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-600 dark:text-slate-400 hover:text-orange-600 hover:bg-white dark:hover:bg-slate-800'}`}
+          >
+            <BookCheck size={16} /> Auditoria Material
+          </button>
+          <button
+            onClick={() => { setViewMode('notas'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
+            className={`px-6 py-2.5 rounded-xl text-[11px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'notas' ? 'bg-orange-600 text-white shadow-md shadow-orange-600/20' : 'text-slate-600 dark:text-slate-400 hover:text-orange-600 hover:bg-white dark:hover:bg-slate-800'}`}
+          >
+            <GraduationCap size={16} /> Consulta de Dados
+          </button>
+        </div>
+
+        {viewMode === 'welcome' && (
+          <div className={`rounded-[2rem] shadow-sm border p-12 text-center flex flex-col items-center justify-center min-h-[50vh] animate-in fade-in zoom-in-95 duration-500 transition-all ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+            <div className={`w-32 h-32 ${isDarkMode ? 'bg-white/5' : 'bg-orange-50'} rounded-full flex items-center justify-center mb-8 transition-colors`}>
+              <img
+                src="https://iconecolegioecurso.com.br/wp-content/uploads/2022/08/xlogo_icone_site.png.pagespeed.ic_.QgXP3GszLC.webp"
+                alt="Logo Ícone"
+                className="w-20 h-20 object-contain"
+              />
+            </div>
+            <h1 className="text-3xl font-black text-slate-800 dark:text-slate-100 uppercase tracking-tight mb-4 text-center">Bem-vindo ao Sistema</h1>
+            <p className="text-slate-500 dark:text-slate-400 max-w-md font-medium text-sm text-center">
+              Selecione uma das guias acima para iniciar.
+            </p>
+          </div>
+        )}
+
+        {viewMode !== 'welcome' && (
+          <>
+            <div className={`rounded-[2rem] shadow-xl relative overflow-hidden group animate-in fade-in duration-300 border transition-all ${isDarkMode ? 'bg-slate-900 border-slate-800 shadow-slate-950/50' : 'bg-white border-slate-200 shadow-slate-200/50'}`}>
+              {/* Efeito Glass decorativo */}
+              <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-indigo-50/20 dark:bg-white/5 rounded-full blur-3xl -translate-y-1/2 translate-x-1/2 pointer-events-none transition-colors duration-700 group-hover:bg-orange-500/10"></div>
+
+              <div className="p-8 md:p-12 text-slate-900 dark:text-white relative z-10 transition-colors">
+                <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-8">
+                  <div className="flex items-center gap-6">
+                    <div className={`p-5 rounded-2xl backdrop-blur-md border shadow-inner transition-all ${isDarkMode ? 'bg-white/10 border-white/10' : 'bg-slate-100 border-slate-200'}`}>
+                      {viewMode === 'auditoria' ? <BookCheck size={40} className="text-orange-500 dark:text-orange-400" /> : <GraduationCap size={40} className="text-orange-500 dark:text-orange-400" />}
+                    </div>
+                    <div>
+                      <h1 className="text-3xl font-black uppercase tracking-tight leading-none mb-2">
+                        {viewMode === 'auditoria' ? 'Auditoria Material 2026' : 'Consulta de dados'}
+                      </h1>
+                      <div className="flex items-center gap-2">
+
+                      </div>
+                    </div>
+                  </div>
+
+                  {viewMode === 'auditoria' && (
+                    <div className={`p-1.5 pl-5 rounded-2xl flex flex-col gap-1 backdrop-blur-sm border min-w-[300px] shadow-sm transition-all ${isDarkMode ? 'bg-slate-950/50 border-white/10 shadow-slate-950' : 'bg-slate-100 border-slate-200'}`}>
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest flex items-center gap-1.5 mt-2 transition-colors">
                         <Building2 size={10} /> Unidade Selecionada
                       </label>
                       <div className="relative group/select">
                         <select
-                          className="w-full bg-transparent text-white font-bold text-sm uppercase appearance-none outline-none py-3 pr-8 cursor-pointer group-hover/select:text-orange-400 transition-colors"
+                          className="w-full bg-transparent text-slate-900 dark:text-white font-bold text-sm uppercase appearance-none outline-none py-3 pr-8 cursor-pointer group-hover/select:text-orange-600 dark:group-hover/select:text-orange-400 transition-colors"
                           value={selectedUnidade}
                           onChange={(e) => {
                             setSelectedUnidade(e.target.value);
                             setTurmas([]);
                             setSelectedTurmaId(null);
+                            setAlunos([]);
                           }}
                         >
                           {Object.entries(UNIDADES_CONFIG).map(([key, config]) => (
-                            <option key={key} value={key} className="bg-slate-900 text-white">{config.nome}</option>
+                            <option key={key} value={key} className="bg-white dark:bg-slate-900 text-slate-900 dark:text-white">{config.nome}</option>
                           ))}
                         </select>
-                        <ChevronDown size={16} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-500 group-hover/select:text-orange-500 transition-colors" />
+                        <ChevronDown size={16} className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400 dark:text-slate-500 group-hover/select:text-orange-600 dark:group-hover/select:text-orange-500 transition-colors" />
                       </div>
                     </div>
-                  </div>
+                  )}
                 </div>
+              </div>
 
-                <div className="bg-white py-4 px-8 md:px-12 flex flex-col md:flex-row justify-between items-center gap-4">
+              {viewMode === 'auditoria' && (
+                <div className="bg-slate-50/50 dark:bg-slate-950 py-4 px-8 md:px-12 flex flex-col md:flex-row justify-between items-center gap-4 border-t border-slate-100 dark:border-slate-800 transition-colors">
                   <div className="flex items-center gap-3">
-                    <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)] animate-pulse"></div>
-                    <span className="text-[11px] font-black uppercase tracking-widest text-slate-400">Sistema Conectado e Pronto</span>
+                    <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.3)] animate-pulse"></div>
+                    <span className="text-[11px] font-black uppercase tracking-widest text-slate-500 dark:text-slate-500 text-center transition-colors">Sistema Conectado e Pronto</span>
                   </div>
                   <button
                     onClick={fetchTurmas}
@@ -1783,533 +2189,452 @@ const App = () => {
                     {loadingTurmas ? <Loader2 className="animate-spin" size={16} /> : <><Play size={16} fill="currentColor" /> Carregar Turmas 2026</>}
                   </button>
                 </div>
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border-l-4 border-red-500 text-red-600 p-6 rounded-2xl flex items-center gap-4 shadow-sm animate-in slide-in-from-top-4">
-                  <AlertCircle className="shrink-0" size={24} />
-                  <p className="font-bold text-sm">{error}</p>
-                </div>
               )}
+            </div>
 
-              {/* BARRA DE PESQUISA GLOBAL — Notas Mode */}
-              {viewMode === 'notas' && (
-                <div className="relative">
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-1 flex items-center gap-3">
-                    <div className="flex items-center gap-3 flex-1 px-4 py-3">
-                      {globalSearchLoading
-                        ? <Loader2 size={18} className="text-indigo-400 animate-spin flex-shrink-0" />
-                        : <Globe size={18} className="text-indigo-400 flex-shrink-0" />
-                      }
-                      <input
-                        ref={searchInputRef}
-                        type="text"
-                        placeholder="Pesquisar aluno em todas as unidades..."
-                        value={globalSearch}
-                        onChange={e => {
-                          const val = e.target.value;
-                          setGlobalSearch(val);
-                          setGlobalSearchOpen(true);
-                          clearTimeout(searchDebounceRef.current);
-                          searchDebounceRef.current = setTimeout(() => runGlobalSearch(val), 400);
-                        }}
-                        onFocus={() => { if (globalSearchResults.length > 0) setGlobalSearchOpen(true); }}
-                        className="flex-1 bg-transparent text-slate-800 font-bold text-sm placeholder:text-slate-400 outline-none"
-                      />
-                      {globalSearch && (
-                        <button onClick={() => { setGlobalSearch(''); setGlobalSearchResults([]); setGlobalSearchOpen(false); setGlobalBoletim(null); }} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors">
-                          <XCircle size={16} />
-                        </button>
-                      )}
-                    </div>
-                    <div className="h-8 w-px bg-slate-200 flex-shrink-0" />
-                    <div className="px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-400 flex-shrink-0">
-                      {globalSearchResults.length > 0 ? `${globalSearchResults.length} resultado${globalSearchResults.length !== 1 ? 's' : ''}` : 'Pesquisa Global'}
-                    </div>
+            {error && (
+              <div className="bg-red-50 border-l-4 border-red-500 text-red-600 p-6 rounded-2xl flex items-center gap-4 shadow-sm animate-in slide-in-from-top-4">
+                <AlertCircle className="shrink-0" size={24} />
+                <p className="font-bold text-sm">{error}</p>
+              </div>
+            )}
+
+            {/* BARRA DE PESQUISA GLOBAL — Notas Mode */}
+            {viewMode === 'notas' && (
+              <div className="relative">
+                <div className={`rounded-2xl shadow-sm border p-1 flex items-center gap-3 transition-all ${isDarkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+                  <div className="flex items-center gap-3 flex-1 px-4 py-3">
+                    {globalSearchLoading
+                      ? <Loader2 size={18} className="text-orange-400 animate-spin flex-shrink-0" />
+                      : <Globe size={18} className="text-orange-400 flex-shrink-0" />
+                    }
+                    <input
+                      ref={searchInputRef}
+                      type="text"
+                      placeholder="Informe o nome do aluno"
+                      value={globalSearch}
+                      onChange={e => {
+                        const val = e.target.value;
+                        setGlobalSearch(val);
+                        setGlobalSearchOpen(true);
+                        clearTimeout(searchDebounceRef.current);
+                        searchDebounceRef.current = setTimeout(() => runGlobalSearch(val), 400);
+                      }}
+                      onFocus={() => { if (globalSearchResults.length > 0) setGlobalSearchOpen(true); }}
+                      className="flex-1 bg-transparent text-slate-800 dark:text-slate-100 font-bold text-sm placeholder:text-slate-500 dark:placeholder:text-slate-600 outline-none"
+                    />
+                    {globalSearch && (
+                      <button onClick={() => { setGlobalSearch(''); setGlobalSearchResults([]); setGlobalSearchOpen(false); setGlobalBoletim(null); }} className="p-1 rounded-lg text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
+                        <XCircle size={16} />
+                      </button>
+                    )}
                   </div>
+                  <div className="h-8 w-px bg-slate-200 dark:bg-slate-800 flex-shrink-0" />
+                  <div className="px-4 py-2 text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500 flex-shrink-0">
+                    {globalSearchResults.length > 0 ? `${globalSearchResults.length} resultado${globalSearchResults.length !== 1 ? 's' : ''}` : 'Pesquisa Global'}
+                  </div>
+                </div>
 
-                  {/* Dropdown de autocompletamento */}
-                  {globalSearchOpen && globalSearchResults.length > 0 && (
-                    <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-2xl border border-slate-200 z-40 overflow-hidden max-h-72 overflow-y-auto">
-                      {globalSearchResults.map((result) => (
-                        <div
-                          key={`${result.unidadeKey}-${result.id}`}
-                          className="w-full text-left px-4 sm:px-5 py-3.5 hover:bg-indigo-50 transition-colors flex items-center justify-between border-b border-slate-100 last:border-0 group"
-                        >
-                          <button onClick={() => fetchGlobalDetalhes(result)} className="flex-1 flex items-center gap-3 text-left overflow-hidden">
-                            <div className="w-8 h-8 rounded-xl bg-indigo-100 text-indigo-600 flex items-center justify-center font-black text-sm flex-shrink-0">
-                              {result.nome.charAt(0)}
-                            </div>
-                            <div className="min-w-0 pr-2">
-                              <p className="font-bold text-sm text-slate-800 group-hover:text-indigo-900 truncate">{result.nome}</p>
-                              {result.unidades && result.unidades.length > 0 ? (
-                                <div className="flex flex-wrap gap-1 mt-1">
-                                  {result.unidades.map(u => (
-                                    <span key={u.unidadeKey} className="text-[9px] font-black uppercase tracking-widest text-indigo-400 bg-indigo-50 px-1.5 py-0.5 rounded border border-indigo-100 whitespace-nowrap truncate max-w-full">{u.unidadeNome}</span>
-                                  ))}
-                                </div>
-                              ) : (
-                                <p className="text-[9px] font-black uppercase tracking-widest text-indigo-400 mt-0.5 truncate">{result.unidadeNome}</p>
+                {/* Dropdown de autocompletamento */}
+                {globalSearchOpen && globalSearchResults.length > 0 && (
+                  <div className="absolute left-0 right-0 top-full mt-2 bg-white dark:bg-slate-900 rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 z-40 overflow-hidden max-h-72 overflow-y-auto transition-colors">
+                    {globalSearchResults.map((result) => (
+                      <div
+                        key={`${result.unidadeKey}-${result.id}`}
+                        className="w-full text-left px-4 sm:px-5 py-3.5 hover:bg-orange-50 dark:hover:bg-orange-950/20 transition-colors flex items-center justify-between border-b border-slate-100 dark:border-slate-800 last:border-0 group"
+                      >
+                        <button onClick={() => fetchGlobalDetalhes(result)} className="flex-1 flex items-center gap-3 text-left overflow-hidden">
+                          <div className="w-8 h-8 rounded-xl bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 flex items-center justify-center font-black text-sm flex-shrink-0">
+                            {result.nome.charAt(0)}
+                          </div>
+                          <div className="min-w-0 pr-2">
+                            <div className="flex items-center gap-2 overflow-hidden">
+                              <p className="font-bold text-sm text-slate-800 dark:text-slate-200 group-hover:text-orange-600 dark:group-hover:text-orange-400 truncate transition-colors">{result.nome}</p>
+                              <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-md uppercase tracking-widest border flex-shrink-0 ${result.situacao === 'Ativo' ? 'bg-green-50 dark:bg-green-950/30 border-green-200 dark:border-green-800 text-green-600 dark:text-green-400' : 'bg-red-50 dark:bg-red-950/30 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400'}`}>
+                                {result.situacao}
+                              </span>
+                              {result.turmaNome && (
+                                <span className="text-[8px] font-black px-1.5 py-0.5 rounded-md uppercase tracking-widest bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 flex-shrink-0">
+                                  {result.turmaNome}
+                                </span>
                               )}
                             </div>
-                          </button>
-
-                          <div className="flex items-center gap-1.5 sm:gap-3 pl-2 sm:pl-4 border-l border-slate-100 ml-1">
-                            <button onClick={() => fetchGlobalDetalhes(result)} className="hidden sm:block text-[9px] font-black uppercase tracking-widest text-slate-300 group-hover:text-orange-400 transition-colors px-2 py-1.5 bg-slate-100 group-hover:bg-orange-100 rounded-lg whitespace-nowrap">
-                              Ver Dados
-                            </button>
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                if (savedStudents.find(s => s.nome === result.nome)) {
-                                  setSavedStudents(prev => prev.filter(s => s.nome !== result.nome));
-                                } else {
-                                  setSavedStudents(prev => [...prev, result]);
-                                }
-                              }}
-                              className={`${savedStudents.find(s => s.nome === result.nome) ? 'text-green-500 bg-green-50 hover:bg-red-50 hover:text-red-500' : 'text-slate-400 hover:text-white bg-slate-100 hover:bg-green-500'} p-2 rounded-xl transition-all shadow-sm flex-shrink-0 group/action`}
-                              title={savedStudents.find(s => s.nome === result.nome) ? "Remover dos Alunos Salvos" : "Salvar Aluno para Exportar"}
-                            >
-                              {savedStudents.find(s => s.nome === result.nome)
-                                ? <><CheckCircle size={18} strokeWidth={2.5} className="group-hover/action:hidden" /><XCircle size={18} strokeWidth={2.5} className="hidden group-hover/action:block" /></>
-                                : <Plus size={18} strokeWidth={2.5} />}
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-
-                  {/* Dropdown vazio (sem resultados) */}
-                  {globalSearchOpen && !globalSearchLoading && globalSearch.trim().length >= 3 && globalSearchResults.length === 0 && (
-                    <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-slate-200 z-40 px-5 py-6 text-center">
-                      <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno encontrado com esse nome</p>
-                    </div>
-                  )}
-                </div>
-              )}
-
-
-              {/* Lista de Turmas */}
-              <div className="space-y-4 pb-20">
-                {turmas.map((turma) => (
-                  <div key={turma.id} className={`bg-white rounded-[2rem] shadow-sm border transaction-all duration-300 overflow-hidden ${selectedTurmaId === turma.id ? 'ring-2 ring-orange-500 border-transparent shadow-xl shadow-orange-100' : 'border-slate-200 hover:border-orange-200 hover:shadow-md'}`}>
-                    <div
-                      onClick={() => fetchAlunosEMateriais(turma.id)}
-                      className="w-full cursor-pointer text-left p-6 md:p-8 flex items-center justify-between group transition-colors"
-                    >
-                      <div className="flex items-center gap-6">
-                        <div className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-600 text-white shadow-lg shadow-orange-300' : 'bg-slate-100 text-slate-400 group-hover:bg-orange-50 group-hover:text-orange-500'}`}>
-                          <LayoutList size={24} />
-                        </div>
-                        <div>
-                          <h3 className="font-black text-slate-800 uppercase tracking-tight text-xl transition-colors group-hover:text-orange-600">
-                            {turma.nome} <span className="text-slate-300 font-medium ml-2">- 2026</span>
-                          </h3>
-                          <div className="flex items-center gap-3 mt-1.5">
-                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest bg-slate-100 px-2.5 py-1 rounded-md border border-slate-200 transition-colors group-hover:border-orange-200 group-hover:bg-orange-50 group-hover:text-orange-600">
-                              {turma.sigla}
-                            </span>
-                            <span className="text-[10px] font-black text-white px-2.5 py-1 rounded-md uppercase tracking-widest shadow-sm bg-orange-500 shadow-orange-200">
-                              {turma.vagasOcupadas} Alunos
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-3">
-                        <button
-                          onClick={(e) => handleDownloadReport(turma, e)}
-                          disabled={downloadingTurmaId === turma.id}
-                          className={`w-10 h-10 rounded-full flex items-center justify-center transition-all border ${downloadingTurmaId === turma.id ? 'bg-orange-100 border-orange-200 text-orange-600 animate-pulse cursor-wait' : 'bg-white border-slate-200 text-slate-400 hover:border-green-300 hover:text-green-600 hover:bg-green-50 hover:shadow-sm'}`}
-                          title="Baixar Planilha da Turma"
-                        >
-                          {downloadingTurmaId === turma.id ? <Loader2 size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
-                        </button>
-
-                        <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-100/50 rotate-180' : 'bg-slate-50 group-hover:bg-orange-50'}`}>
-                          <ChevronDown className={`transition-colors ${selectedTurmaId === turma.id ? 'text-orange-600' : 'text-slate-400 group-hover:text-orange-500'}`} />
-                        </div>
-                      </div>
-                    </div>
-
-                    {selectedTurmaId === turma.id && (
-                      <div className="border-t border-slate-100 bg-slate-50/50 animate-in slide-in-from-top-2 duration-300">
-
-                        {/* Barra de Progresso da Turma */}
-                        {loadingAlunos && (
-                          <div className="p-8 pb-0">
-                            <div className="bg-white rounded-2xl p-6 border border-orange-100 shadow-sm flex items-center gap-5">
-                              <div className="p-3 bg-orange-50 rounded-xl relative">
-                                <Loader2 className="animate-spin text-orange-500" size={24} />
-                              </div>
-                              <div className="flex-1 space-y-2">
-                                <div className="flex justify-between text-[11px] font-black uppercase tracking-widest text-slate-400">
-                                  <span className="text-orange-600">{viewMode === 'notas' ? 'Buscando Histórico de Notas' : 'Cruzando Dados Financeiros'}</span>
-                                  <span>{Math.round((progressAluno.current / Math.max(progressAluno.total, 1)) * 100)}%</span>
-                                </div>
-                                <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
-                                  <div
-                                    className="h-full bg-gradient-to-r from-orange-500 to-orange-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(249,115,22,0.5)]"
-                                    style={{ width: `${(progressAluno.current / Math.max(progressAluno.total, 1)) * 100}%` }}
-                                  />
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        )}
-
-                        <div className="p-8">
-                          <div className="flex justify-between items-center mb-6">
-                            <h4 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em] flex items-center gap-2">
-                              <Users size={14} /> Lista de Alunos
-                            </h4>
-                            <button
-                              onClick={() => viewMode === 'auditoria' ? setFiltroCompradores(!filtroCompradores) : setFiltroVeteranos(!filtroVeteranos)}
-                              className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm ${(viewMode === 'auditoria' && filtroCompradores) || (viewMode === 'notas' && filtroVeteranos)
-                                ? 'bg-slate-800 text-white shadow-slate-800/20 ring-2 ring-slate-800 ring-offset-2 ring-offset-slate-50'
-                                : 'bg-white border border-slate-200 text-slate-500 hover:bg-white hover:text-orange-600 hover:border-orange-200'
-                                }`}
-                            >
-                              <Filter size={12} />
-                              {viewMode === 'auditoria'
-                                ? (filtroCompradores ? 'Mostrando: Apenas Compradores' : 'Filtrar Compradores')
-                                : (filtroVeteranos ? 'Mostrando: Apenas Veteranos' : 'Filtrar Veteranos')}
-                            </button>
-                          </div>
-
-                          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
-                            {alunosExibidos.length > 0 ? (
-                              <div className="divide-y divide-slate-100">
-                                {alunosExibidos.map((aluno) => (
-                                  <div key={aluno.id} className="p-4 flex items-center justify-between hover:bg-slate-50 transition-colors group">
-                                    <div className="flex items-center gap-4">
-                                      <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs shadow-sm transition-colors ${aluno.material.comprou
-                                        ? 'bg-green-100 text-green-700 shadow-green-100'
-                                        : 'bg-slate-100 text-slate-400 group-hover:bg-white group-hover:shadow-sm group-hover:text-slate-500'
-                                        }`}>
-                                        {aluno.nome.charAt(0)}
-                                      </div>
-                                      <div>
-                                        <p className={`font-bold text-sm uppercase tracking-tight ${aluno.material.comprou ? 'text-slate-800' : 'text-slate-500'}`}>{aluno.nome}</p>
-                                        <p className="font-mono text-[10px] text-slate-400">ID: <span className="font-bold">{aluno.id}</span></p>
-                                      </div>
-                                    </div>
-
-                                    <div className="flex items-center gap-6">
-                                      {/* Info Secundária */}
-                                      {viewMode === 'auditoria' ? (
-                                        <>
-                                          {/* Status Material */}
-                                          {aluno.material.loading ? (
-                                            <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
-                                          ) : (
-                                            <div className={`px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border flex items-center gap-1.5 min-w-[140px] justify-center ${aluno.material.comprou
-                                              ? 'bg-blue-50 border-blue-100 text-blue-600'
-                                              : 'bg-slate-50 border-slate-100 text-slate-300'
-                                              }`}>
-                                              {aluno.material.comprou ? (
-                                                <><BookCheck size={12} /> {aluno.material.det.substring(0, 15)}...</>
-                                              ) : (
-                                                <><XCircle size={12} /> Não Identificado</>
-                                              )}
-                                            </div>
-                                          )}
-
-                                          {/* Status Pagamento */}
-                                          <div className="w-28 text-right">
-                                            {aluno.material.loading ? (
-                                              <div className="w-16 h-4 bg-slate-100 rounded animate-pulse ml-auto" />
-                                            ) : aluno.material.comprou ? (
-                                              aluno.material.pago ? (
-                                                <div className="inline-flex items-center gap-1.5 text-green-600 font-black text-[10px] uppercase tracking-widest bg-green-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-green-600/20">
-                                                  <CheckCircle size={12} /> Pago
-                                                </div>
-                                              ) : (
-                                                <div className="inline-flex items-center gap-1.5 text-orange-600 font-black text-[10px] uppercase tracking-widest bg-orange-50 px-3 py-1.5 rounded-full ring-1 ring-inset ring-orange-600/20 animate-pulse">
-                                                  <DollarSign size={12} /> Pendente
-                                                </div>
-                                              )
-                                            ) : (
-                                              <span className="text-slate-200 font-bold text-xl">-</span>
-                                            )}
-                                          </div>
-                                        </>
-                                      ) : (
-                                        <>
-                                          {/* Status Veterano */}
-                                          {aluno.material.loading ? (
-                                            <div className="w-24 h-6 bg-slate-100 rounded animate-pulse" />
-                                          ) : aluno.material.anosAnteriores?.length > 0 ? (
-                                            <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-indigo-50 border-indigo-100 text-indigo-600 flex items-center gap-1.5 min-w-[140px] justify-center">
-                                              <GraduationCap size={12} /> Veterano ({aluno.material.anosAnteriores.map(a => a.ano).join(', ')})
-                                            </div>
-                                          ) : (
-                                            <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-slate-50 border-slate-100 text-slate-400 flex items-center gap-1.5 min-w-[140px] justify-center">
-                                              <User size={12} /> Novato (Só 2026)
-                                            </div>
-                                          )}
-
-                                          {/* Botão Ver Notas */}
-                                          <div className="w-28 text-right">
-                                            {!aluno.material.loading && aluno.material.anosAnteriores?.length > 0 && (
-                                              <button
-                                                onClick={(e) => { e.stopPropagation(); fetchBoletimAluno(aluno); }}
-                                                className="inline-flex items-center gap-1.5 text-indigo-600 font-black text-[10px] uppercase tracking-widest bg-indigo-50 px-3 py-1.5 rounded-lg border border-indigo-200 hover:bg-indigo-600 hover:text-white transition-colors"
-                                              >
-                                                <BookCheck size={12} /> Ver Notas
-                                              </button>
-                                            )}
-                                          </div>
-                                        </>
-                                      )}
-
-                                      {/* Botão Mais Opções */}
-                                      <button
-                                        onClick={(e) => { e.stopPropagation(); fetchDetalhesAluno(aluno); }}
-                                        className="w-8 h-8 rounded-full hover:bg-slate-100 flex items-center justify-center text-slate-400 hover:text-orange-500 transition-colors"
-                                      >
-                                        <div className="flex gap-0.5">
-                                          <div className="w-1 h-1 bg-current rounded-full"></div>
-                                          <div className="w-1 h-1 bg-current rounded-full"></div>
-                                          <div className="w-1 h-1 bg-current rounded-full"></div>
-                                        </div>
-                                      </button>
-                                    </div>
-                                  </div>
+                            {result.unidades && result.unidades.length > 0 ? (
+                              <div className="flex flex-wrap gap-1 mt-1">
+                                {result.unidades.map(u => (
+                                  <span key={u.unidadeKey} className="text-[9px] font-black uppercase tracking-widest text-orange-400 bg-orange-50 dark:bg-orange-900/20 px-1.5 py-0.5 rounded border border-orange-100 dark:border-orange-800 whitespace-nowrap truncate max-w-full">{u.unidadeNome}</span>
                                 ))}
                               </div>
                             ) : (
-                              <div className="p-16 text-center text-slate-400 flex flex-col items-center">
-                                {loadingAlunos ? (
-                                  <div className="flex flex-col items-center gap-3">
-                                    <Loader2 className="animate-spin text-orange-400" size={32} />
-                                    <p className="text-[10px] font-black uppercase tracking-widest">Carregando...</p>
-                                  </div>
-                                ) : (
-                                  <>
-                                    <Users size={32} className="opacity-20 mb-3" />
-                                    <p className="text-[10px] font-black uppercase tracking-widest">Nenhum aluno encontrado</p>
-                                  </>
-                                )}
-                              </div>
-                            )}
-
-                            {/* Footer Stats */}
-                            {!loadingAlunos && alunos.length > 0 && (
-                              <div className="bg-slate-50 border-t border-slate-100 p-4 px-6 flex justify-between items-center text-[10px] font-black uppercase tracking-widest">
-                                <div className="flex gap-6">
-                                  <span className="flex items-center gap-2 text-green-600">
-                                    <div className="w-2 h-2 bg-green-500 rounded-full" />
-                                    Pagos: {alunos.filter(a => a.material.pago).length}
-                                  </span>
-                                  <span className="flex items-center gap-2 text-orange-600">
-                                    <div className="w-2 h-2 bg-orange-500 rounded-full" />
-                                    Pendentes: {alunos.filter(a => a.material.comprou && !a.material.pago).length}
-                                  </span>
-                                </div>
-                                <span className="text-slate-400">Total: {alunos.length} Alunos</span>
-                              </div>
+                              <p className="text-[9px] font-black uppercase tracking-widest text-orange-400 mt-0.5 truncate">{result.unidadeNome}</p>
                             )}
                           </div>
+                        </button>
+
+                        <div className="flex items-center gap-1.5 sm:gap-3 pl-2 sm:pl-4 border-l border-slate-100 dark:border-slate-800 ml-1">
+                          <button onClick={() => fetchGlobalDetalhes(result)} className="hidden sm:block text-[9px] font-black uppercase tracking-widest text-slate-300 dark:text-slate-600 group-hover:text-orange-400 transition-colors px-2 py-1.5 bg-slate-100 dark:bg-slate-800 group-hover:bg-orange-100 dark:group-hover:bg-orange-950/50 rounded-lg whitespace-nowrap">
+                            Ver Dados
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (savedStudents.find(s => s.nome === result.nome)) {
+                                setSavedStudents(prev => prev.filter(s => s.nome !== result.nome));
+                              } else {
+                                setSavedStudents(prev => [...prev, result]);
+                              }
+                            }}
+                            className={`${savedStudents.find(s => s.nome === result.nome) ? 'text-green-500 bg-green-50 dark:bg-green-950/30 hover:bg-red-50 dark:hover:bg-red-950/30 hover:text-red-500' : 'text-slate-400 dark:text-slate-600 hover:text-white bg-slate-100 dark:bg-slate-800 hover:bg-green-500'} p-2 rounded-xl transition-all shadow-sm flex-shrink-0 group/action`}
+                            title={savedStudents.find(s => s.nome === result.nome) ? "Remover dos Alunos Salvos" : "Salvar Aluno para Exportar"}
+                          >
+                            {savedStudents.find(s => s.nome === result.nome)
+                              ? <><CheckCircle size={18} strokeWidth={2.5} className="group-hover/action:hidden" /><XCircle size={18} strokeWidth={2.5} className="hidden group-hover/action:block" /></>
+                              : <Plus size={18} strokeWidth={2.5} />}
+                          </button>
                         </div>
                       </div>
-                    )}
+                    ))}
                   </div>
-                ))}
+                )}
 
-                {turmas.length === 0 && !loadingTurmas && (
-                  <div className="py-32 flex flex-col items-center justify-center text-center opacity-40">
-                    <School size={64} className="text-slate-300 stroke-1 mb-4" />
-                    <p className="text-sm font-black text-slate-400 uppercase tracking-[0.3em]">Nenhuma turma carregada</p>
-                    <p className="text-[10px] font-bold text-slate-300 mt-2">Selecione uma unidade e clique em carregar</p>
+                {/* Dropdown vazio (sem resultados) */}
+                {globalSearchOpen && !globalSearchLoading && globalSearch.trim().length >= 3 && globalSearchResults.length === 0 && (
+                  <div className="absolute left-0 right-0 top-full mt-2 bg-white rounded-2xl shadow-xl border border-slate-200 z-40 px-5 py-6 text-center">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno encontrado com esse nome</p>
                   </div>
                 )}
               </div>
-            </>
-          )}
-        </div>
+            )}
 
-        {/* BARRA LATERAL - ALUNOS SALVOS */}
-        <div
-          className="w-full lg:w-[360px] shrink-0 bg-white rounded-[2rem] shadow-sm border border-slate-200 transaction-all duration-300 overflow-hidden flex flex-col sticky top-8 max-h-[calc(100vh-4rem)]"
-        >
-          <div className="p-6 bg-slate-50 border-b border-slate-100">
-            <div className="flex justify-between items-center mb-1">
-              <h3 className="font-black text-slate-800 uppercase tracking-tight text-sm flex items-center gap-2">
-                Alunos Salvos
-                <span className="bg-indigo-100 text-indigo-600 text-[10px] px-2 py-0.5 rounded-full">{savedStudents.length}</span>
-              </h3>
-              <div className="flex gap-2">
-                {savedStudents.length > 0 && (
-                  <button
-                    onClick={() => setSavedStudents([])}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-slate-400 bg-slate-200 hover:bg-red-50 hover:text-red-500 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors"
+
+            {/* Lista de Turmas */}
+            <div className="space-y-4 pb-20">
+              {turmas.map((turma) => (
+                <div key={turma.id} className={`bg-white dark:bg-slate-900 rounded-[2rem] shadow-sm border transition-all duration-300 overflow-hidden ${selectedTurmaId === turma.id ? 'ring-2 ring-orange-500 border-transparent shadow-xl shadow-orange-900/20' : 'border-slate-200 dark:border-slate-800 hover:border-orange-200 dark:hover:border-orange-900 hover:shadow-md dark:hover:shadow-orange-900/5'}`}>
+                  <div
+                    onClick={() => fetchAlunosEMateriais(turma.id)}
+                    className="w-full cursor-pointer text-left p-6 md:p-8 flex items-center justify-between group transition-colors"
                   >
-                    Limpar
-                  </button>
-                )}
-                <button
-                  onClick={handleExportSavedStudents}
-                  disabled={savedStudents.length === 0 || exportingSavedStudents}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 text-white rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors shadow-sm disabled:shadow-none disabled:bg-slate-200 disabled:text-slate-400 ${exportingSavedStudents ? 'bg-amber-500' : 'bg-green-600 hover:bg-green-500'}`}
-                >
-                  {exportingSavedStudents ? <Loader2 size={12} className="animate-spin" /> : <FileSpreadsheet size={12} />}
-                  {exportingSavedStudents && exportProgress ? `${exportProgress.current}/${exportProgress.total}` : 'Exportar'}
-                </button>
-              </div>
-            </div>
+                    <div className="flex items-center gap-6">
+                      <div className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-600 text-white shadow-lg shadow-orange-900/30' : 'bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500 group-hover:bg-orange-50 dark:group-hover:bg-orange-950/30 group-hover:text-orange-500'}`}>
+                        <LayoutList size={24} />
+                      </div>
+                      <div>
+                        <h3 className="font-black text-slate-800 dark:text-slate-100 uppercase tracking-tight text-xl transition-colors group-hover:text-orange-600">
+                          {turma.nome} <span className="text-slate-300 dark:text-slate-700 font-medium ml-2">- 2026</span>
+                        </h3>
+                        <div className="flex items-center gap-3 mt-1.5">
+                          <span className="text-[10px] font-black text-slate-500 dark:text-slate-400 uppercase tracking-widest bg-slate-100 dark:bg-slate-800 px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 transition-colors group-hover:border-orange-200 dark:group-hover:border-orange-900 group-hover:bg-orange-50 dark:group-hover:bg-orange-900/20 group-hover:text-orange-600 dark:group-hover:text-orange-400">
+                            {turma.sigla}
+                          </span>
+                          <span className="text-[10px] font-black text-white px-2.5 py-1 rounded-md uppercase tracking-widest shadow-sm bg-orange-500 shadow-orange-900/20">
+                            {turma.vagasOcupadas} Alunos
+                          </span>
+                        </div>
+                      </div>
+                    </div>
 
-            <div className="min-h-[16px]">
-              {exportingSavedStudents && exportProgress ? (
-                <p className="text-[10px] text-amber-600 font-bold uppercase tracking-widest flex items-center gap-1.5 truncate">
-                  Buscando: {exportProgress.studentName}
-                </p>
-              ) : exportErrors.length > 0 ? (
-                <p className="text-[10px] text-red-500 font-bold uppercase tracking-widest flex items-center gap-1.5 truncate" title={`Erro em: ${exportErrors.join(', ')}`}>
-                  <AlertCircle size={10} /> Não foi possível buscar as notas de {exportErrors.length} aluno(s)
-                </p>
-              ) : (
-                <p className="text-[10px] text-slate-400 uppercase tracking-widest">
-                  Adicione alunos clicando no '+' na pesquisa
-                </p>
+                    <div className="flex items-center gap-3">
+                      <button
+                        onClick={(e) => handleDownloadReport(turma, e)}
+                        disabled={downloadingTurmaId === turma.id}
+                        className={`w-10 h-10 rounded-full flex items-center justify-center transition-all border ${downloadingTurmaId === turma.id ? 'bg-orange-100 dark:bg-orange-900/30 border-orange-200 dark:border-orange-800 text-orange-600 dark:text-orange-400 animate-pulse cursor-wait' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-500 hover:border-green-300 dark:hover:border-green-800 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-950/30 hover:shadow-sm'}`}
+                        title="Baixar Planilha da Turma"
+                      >
+                        {downloadingTurmaId === turma.id ? <Loader2 size={18} className="animate-spin" /> : <FileSpreadsheet size={18} />}
+                      </button>
+
+                      <div className={`w-10 h-10 rounded-full flex items-center justify-center transition-all duration-300 ${selectedTurmaId === turma.id ? 'bg-orange-100/50 dark:bg-orange-900/20 rotate-180' : 'bg-slate-50 dark:bg-slate-800 group-hover:bg-orange-50 dark:group-hover:bg-orange-950/30'}`}>
+                        <ChevronDown className={`transition-colors ${selectedTurmaId === turma.id ? 'text-orange-600' : 'text-slate-400 group-hover:text-orange-500'}`} />
+                      </div>
+                    </div>
+                  </div>
+
+                  {selectedTurmaId === turma.id && (
+                    <div className="border-t border-slate-100 dark:border-slate-800 bg-slate-50/50 dark:bg-slate-950 animate-in slide-in-from-top-2 duration-300 transition-colors">
+
+                      {/* Barra de Progresso da Turma */}
+                      {loadingAlunos && (
+                        <div className="p-8 pb-0">
+                          <div className="bg-white dark:bg-slate-900 rounded-2xl p-6 border border-orange-100 dark:border-orange-900/30 shadow-sm flex items-center gap-5 transition-colors">
+                            <div className="p-3 bg-orange-50 dark:bg-orange-900/20 rounded-xl relative">
+                              <Loader2 className="animate-spin text-orange-500" size={24} />
+                            </div>
+                            <div className="flex-1 space-y-2">
+                              <div className="flex justify-between text-[11px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500">
+                                <span className="text-orange-600 dark:text-orange-400">{viewMode === 'notas' ? 'Buscando Histórico de Notas' : 'Cruzando Dados Financeiros'}</span>
+                                <span>{Math.round((progressAluno.current / Math.max(progressAluno.total, 1)) * 100)}%</span>
+                              </div>
+                              <div className="h-2 bg-slate-100 dark:bg-slate-800 rounded-full overflow-hidden">
+                                <div
+                                  className="h-full bg-gradient-to-r from-orange-500 to-orange-400 transition-all duration-300 ease-out shadow-[0_0_10px_rgba(249,115,22,0.5)]"
+                                  style={{ width: `${(progressAluno.current / Math.max(progressAluno.total, 1)) * 100}%` }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="p-8">
+                        <div className="flex justify-between items-center mb-6">
+                          <h4 className="text-xs font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] flex items-center gap-2">
+                            <Users size={14} /> Lista de Alunos
+                          </h4>
+                          <button
+                            onClick={() => viewMode === 'auditoria' ? setFiltroCompradores(!filtroCompradores) : setFiltroVeteranos(!filtroVeteranos)}
+                            className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all shadow-sm ${(viewMode === 'auditoria' && filtroCompradores) || (viewMode === 'notas' && filtroVeteranos)
+                              ? 'bg-slate-800 dark:bg-orange-600 text-white shadow-slate-800/20 dark:shadow-orange-900/40 ring-2 ring-slate-800 dark:ring-orange-600 ring-offset-2 ring-offset-slate-50 dark:ring-offset-slate-900'
+                              : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400 hover:bg-white dark:hover:bg-slate-800 hover:text-orange-600 dark:hover:text-orange-400 hover:border-orange-200 dark:hover:border-orange-900'
+                              }`}
+                          >
+                            <Filter size={12} />
+                            {viewMode === 'auditoria'
+                              ? (filtroCompradores ? 'Mostrando: Apenas Compradores' : 'Filtrar Compradores')
+                              : (filtroVeteranos ? 'Mostrando: Apenas Veteranos' : 'Filtrar Veteranos')}
+                          </button>
+                        </div>
+
+                        <div className="bg-white dark:bg-slate-900 rounded-2xl shadow-sm border border-slate-200 dark:border-slate-800 overflow-hidden transition-colors">
+                          {alunosExibidos.length > 0 ? (
+                            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+                              {alunosExibidos.map((aluno) => (
+                                <div key={aluno.id} className="p-4 flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors group">
+                                  <div className="flex items-center gap-4">
+                                    <div className={`w-10 h-10 rounded-xl flex items-center justify-center font-black text-xs shadow-sm transition-colors ${aluno.material.comprou
+                                      ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 shadow-green-100 dark:shadow-none'
+                                      : 'bg-slate-100 dark:bg-slate-800 text-slate-400 group-hover:bg-white dark:group-hover:bg-slate-700 group-hover:shadow-sm group-hover:text-slate-500 dark:group-hover:text-slate-300'
+                                      }`}>
+                                      {aluno.nome.charAt(0)}
+                                    </div>
+                                    <div>
+                                      <p className={`font-bold text-sm uppercase tracking-tight ${aluno.material.comprou ? 'text-slate-800 dark:text-slate-100' : 'text-slate-500 dark:text-slate-400'}`}>{aluno.nome}</p>
+                                      <p className="font-mono text-[10px] text-slate-400 dark:text-slate-600">ID: <span className="font-bold">{aluno.id}</span></p>
+                                    </div>
+                                  </div>
+
+                                  <div className="flex items-center gap-6">
+                                    {/* Info Secundária */}
+                                    {viewMode === 'auditoria' ? (
+                                      <>
+                                        {/* Status Material */}
+                                        {aluno.material.loading ? (
+                                          <div className="w-24 h-6 bg-slate-100 dark:bg-slate-800 rounded animate-pulse" />
+                                        ) : (
+                                          <div className={`px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border flex items-center gap-1.5 min-w-[140px] justify-center transition-colors ${aluno.material.comprou
+                                            ? 'bg-blue-50 dark:bg-blue-900/20 border-blue-100 dark:border-blue-800 text-blue-600 dark:text-blue-400'
+                                            : 'bg-slate-50 dark:bg-slate-800/50 border-slate-100 dark:border-slate-800 text-slate-300 dark:text-slate-600'
+                                            }`}>
+                                            {aluno.material.comprou ? (
+                                              <><BookCheck size={12} /> {aluno.material.det.substring(0, 15)}...</>
+                                            ) : (
+                                              <><XCircle size={12} /> Não Identificado</>
+                                            )}
+                                          </div>
+                                        )}
+
+                                        {/* Status Pagamento */}
+                                        <div className="w-28 text-right">
+                                          {aluno.material.loading ? (
+                                            <div className="w-16 h-4 bg-slate-100 dark:bg-slate-800 rounded animate-pulse ml-auto" />
+                                          ) : aluno.material.comprou ? (
+                                            aluno.material.pago ? (
+                                              <div className="inline-flex items-center gap-1.5 text-green-600 dark:text-green-400 font-black text-[10px] uppercase tracking-widest bg-green-50 dark:bg-green-900/20 px-3 py-1.5 rounded-full ring-1 ring-inset ring-green-600/20 dark:ring-green-400/20 transition-colors">
+                                                <CheckCircle size={12} /> Pago
+                                              </div>
+                                            ) : (
+                                              <div className="inline-flex items-center gap-1.5 text-orange-600 dark:text-orange-400 font-black text-[10px] uppercase tracking-widest bg-orange-50 dark:bg-orange-900/20 px-3 py-1.5 rounded-full ring-1 ring-inset ring-orange-600/20 dark:ring-orange-400/20 animate-pulse transition-colors">
+                                                <DollarSign size={12} /> Pendente
+                                              </div>
+                                            )
+                                          ) : (
+                                            <span className="text-slate-200 dark:text-slate-800 font-bold text-xl">-</span>
+                                          )}
+                                        </div>
+                                      </>
+                                    ) : (
+                                      <>
+                                        {/* Status Veterano */}
+                                        {aluno.material.loading ? (
+                                          <div className="w-24 h-6 bg-slate-100 dark:bg-slate-800 rounded animate-pulse" />
+                                        ) : aluno.material.anosAnteriores?.length > 0 ? (
+                                          <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-indigo-50 dark:bg-indigo-900/20 border-indigo-100 dark:border-indigo-800 text-indigo-600 dark:text-indigo-400 flex items-center gap-1.5 min-w-[140px] justify-center transition-colors">
+                                            <GraduationCap size={12} /> Veterano ({aluno.material.anosAnteriores.map(a => a.ano).join(', ')})
+                                          </div>
+                                        ) : (
+                                          <div className="px-3 py-1.5 rounded-lg font-black text-[9px] uppercase tracking-widest border bg-slate-50 dark:bg-slate-800/50 border-slate-100 dark:border-slate-800 text-slate-400 dark:text-slate-600 flex items-center gap-1.5 min-w-[140px] justify-center transition-colors">
+                                            <User size={12} /> Novato (Só 2026)
+                                          </div>
+                                        )}
+
+                                        {/* Botão Ver Notas */}
+                                        <div className="w-28 text-right">
+                                          {!aluno.material.loading && aluno.material.anosAnteriores?.length > 0 && (
+                                            <button
+                                              onClick={(e) => { e.stopPropagation(); fetchBoletimAluno(aluno); }}
+                                              className="inline-flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400 font-black text-[10px] uppercase tracking-widest bg-indigo-50 dark:bg-indigo-900/30 px-3 py-1.5 rounded-lg border border-indigo-200 dark:border-indigo-800 hover:bg-indigo-600 dark:hover:bg-indigo-600 hover:text-white transition-all shadow-sm hover:shadow-indigo-900/20"
+                                            >
+                                              <BookCheck size={12} /> Ver Notas
+                                            </button>
+                                          )}
+                                        </div>
+                                      </>
+                                    )}
+
+                                    {/* Botão Mais Opções */}
+                                    <button
+                                      onClick={(e) => { e.stopPropagation(); fetchDetalhesAluno(aluno); }}
+                                      className="w-8 h-8 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 flex items-center justify-center text-slate-400 dark:text-slate-600 hover:text-orange-500 dark:hover:text-orange-400 transition-colors"
+                                    >
+                                      <div className="flex gap-0.5">
+                                        <div className="w-1 h-1 bg-current rounded-full"></div>
+                                        <div className="w-1 h-1 bg-current rounded-full"></div>
+                                        <div className="w-1 h-1 bg-current rounded-full"></div>
+                                      </div>
+                                    </button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="p-16 text-center text-slate-400 dark:text-slate-600 flex flex-col items-center">
+                              {loadingAlunos ? (
+                                <div className="flex flex-col items-center gap-3">
+                                  <Loader2 className="animate-spin text-orange-400" size={32} />
+                                  <p className="text-[10px] font-black uppercase tracking-widest text-slate-500 dark:text-slate-600">Carregando...</p>
+                                </div>
+                              ) : (
+                                <>
+                                  <Users size={32} className="opacity-20 mb-3" />
+                                  <p className="text-[10px] font-black uppercase tracking-widest">Nenhum aluno encontrado</p>
+                                </>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Footer Stats */}
+                          {!loadingAlunos && alunos.length > 0 && (
+                            <div className="bg-slate-50 border-t border-slate-100 p-4 px-6 flex justify-between items-center text-[10px] font-black uppercase tracking-widest">
+                              <div className="flex gap-6">
+                                <span className="flex items-center gap-2 text-green-600">
+                                  <div className="w-2 h-2 bg-green-500 rounded-full" />
+                                  Pagos: {alunos.filter(a => a.material.pago).length}
+                                </span>
+                                <span className="flex items-center gap-2 text-orange-600">
+                                  <div className="w-2 h-2 bg-orange-500 rounded-full" />
+                                  Pendentes: {alunos.filter(a => a.material.comprou && !a.material.pago).length}
+                                </span>
+                              </div>
+                              <span className="text-slate-400">Total: {alunos.length} Alunos</span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {viewMode === 'auditoria' && turmas.length === 0 && !loadingTurmas && (
+                <div className="py-32 flex flex-col items-center justify-center text-center opacity-40">
+                  <School size={64} className="text-slate-300 stroke-1 mb-4" />
+                  <p className="text-sm font-black text-slate-400 uppercase tracking-[0.3em]">Nenhuma turma carregada</p>
+                  <p className="text-[10px] font-bold text-slate-300 mt-2">Selecione uma unidade e clique em carregar</p>
+                </div>
               )}
             </div>
-          </div>
-
-          <div className="p-4 flex-1 overflow-y-auto space-y-2">
-            {savedStudents.length === 0 ? (
-              <div className="py-12 flex flex-col items-center text-center opacity-40">
-                <Users size={32} className="text-slate-300 mb-3" />
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Nenhum aluno salvo</p>
-              </div>
-            ) : (
-              savedStudents.map((student, idx) => (
-                <div
-                  key={`saved-${idx}`}
-                  onClick={() => fetchGlobalDetalhes(student)}
-                  className="p-3 bg-white border border-slate-100 rounded-2xl hover:border-orange-200 hover:shadow-sm transition-all cursor-pointer group relative"
-                >
-                  <div className="flex items-center gap-3 pr-6">
-                    <div className="w-8 h-8 rounded-xl bg-slate-100 text-slate-500 group-hover:bg-indigo-100 group-hover:text-indigo-600 flex items-center justify-center font-black text-[10px] flex-shrink-0 transition-colors">
-                      {student.nome.charAt(0)}
-                    </div>
-                    <div className="flex-1 overflow-hidden">
-                      <p className="font-bold text-xs text-slate-800 truncate group-hover:text-indigo-900">{student.nome}</p>
-                      {student.unidades && student.unidades.length > 0 ? (
-                        <div className="flex flex-wrap gap-1 mt-1">
-                          {student.unidades.map(u => (
-                            <span key={u.unidadeKey} className="text-[8px] font-black uppercase tracking-widest text-slate-400 group-hover:text-indigo-500 bg-slate-50 group-hover:bg-indigo-50 px-1.5 py-0.5 rounded border border-slate-100 group-hover:border-indigo-100 truncate max-w-full">{u.unidadeNome}</span>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 group-hover:text-indigo-400 truncate mt-0.5">{student.unidadeNome}</p>
-                      )}
-                    </div>
-                  </div>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setSavedStudents(prev => prev.filter(s => s.nome !== student.nome));
-                    }}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 p-1.5 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
-                    title="Remover"
-                  >
-                    <XCircle size={14} />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
+          </>
+        )}
       </div>
 
       {/* Modal de Seleção de Disciplinas para Exportação */}
-      {exportModalData && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm" onClick={() => setExportModalData(null)}>
-          <div className="bg-white rounded-[2rem] shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
-            <div className="bg-gradient-to-br from-indigo-700 to-indigo-900 p-6 text-white relative overflow-hidden flex-shrink-0">
-              <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, white 0%, transparent 60%)' }} />
-              <div className="relative z-10 flex items-start justify-between">
-                <div>
-                  <h3 className="font-black text-xl uppercase tracking-tight leading-tight flex items-center gap-2">
-                    <FileSpreadsheet size={24} /> Exportar Notas
-                  </h3>
-                  <p className="text-indigo-200 text-xs font-bold uppercase tracking-widest mt-1">
-                    Selecione as disciplinas que deseja incluir
-                  </p>
+      {
+        exportModalData && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/70 backdrop-blur-sm animate-in fade-in duration-200" onClick={() => setExportModalData(null)}>
+            <div className="bg-white dark:bg-slate-950 rounded-[2rem] shadow-2xl w-full max-w-lg max-h-[90vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200 border border-white/10 dark:border-slate-800/50" onClick={e => e.stopPropagation()}>
+              <div className="bg-gradient-to-br from-indigo-700 to-indigo-900 dark:from-black dark:to-indigo-950 p-6 text-white relative overflow-hidden flex-shrink-0 transition-colors">
+                <div className="absolute inset-0 opacity-10" style={{ backgroundImage: 'radial-gradient(circle at 80% 20%, white 0%, transparent 60%)' }} />
+                <div className="relative z-10 flex items-start justify-between">
+                  <div>
+                    <h3 className="font-black text-xl uppercase tracking-tight leading-tight flex items-center gap-2">
+                      <FileSpreadsheet size={24} /> Exportar Notas
+                    </h3>
+                    <p className="text-indigo-200 dark:text-indigo-400 text-xs font-bold uppercase tracking-widest mt-1">
+                      Selecione as disciplinas que deseja incluir
+                    </p>
+                  </div>
+                  <button onClick={() => setExportModalData(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
+                    <XCircle size={20} className="text-white" />
+                  </button>
                 </div>
-                <button onClick={() => setExportModalData(null)} className="p-2 bg-white/10 rounded-xl hover:bg-white/20 transition-colors">
-                  <XCircle size={20} className="text-white" />
+              </div>
+
+              <div className="p-6 overflow-y-auto flex-1 transition-colors">
+                <div className="flex items-center justify-between mb-4 pb-4 border-b border-slate-100 dark:border-slate-800 transition-colors">
+                  <span className="text-[10px] font-black tracking-widest uppercase text-slate-500 dark:text-slate-600">
+                    {exportModalData.uniqueDisciplines.length} Disciplinas Encontradas
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setSelectedExportDisciplines(new Set(exportModalData.uniqueDisciplines))}
+                      className="text-[9px] font-bold tracking-widest uppercase text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-900/20 px-2 py-1.5 rounded-md border border-indigo-100 dark:border-indigo-800 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                    >
+                      Todas
+                    </button>
+                    <button
+                      onClick={() => setSelectedExportDisciplines(new Set())}
+                      className="text-[9px] font-bold tracking-widest uppercase text-slate-500 dark:text-slate-400 bg-slate-50 dark:bg-slate-900 px-2 py-1.5 rounded-md border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                    >
+                      Nenhuma
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  {exportModalData.uniqueDisciplines.map(disc => {
+                    const isChecked = selectedExportDisciplines.has(disc);
+                    return (
+                      <label key={disc} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${isChecked ? 'bg-indigo-50 dark:bg-indigo-900/20 border-indigo-200 dark:border-indigo-800' : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800'}`}>
+                        <input
+                          type="checkbox"
+                          checked={isChecked}
+                          onChange={() => {
+                            setSelectedExportDisciplines(prev => {
+                              const newSet = new Set(prev);
+                              if (isChecked) newSet.delete(disc);
+                              else newSet.add(disc);
+                              return newSet;
+                            });
+                          }}
+                          className="w-5 h-5 rounded border-slate-300 dark:border-slate-700 text-indigo-600 dark:text-indigo-400 focus:ring-indigo-500 dark:bg-slate-800 shadow-sm"
+                        />
+                        <span className={`text-sm font-bold uppercase tracking-tight transition-colors ${isChecked ? 'text-indigo-900 dark:text-indigo-100' : 'text-slate-600 dark:text-slate-400'}`}>{disc}</span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="p-6 border-t border-slate-100 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 flex justify-end gap-3 flex-shrink-0 transition-colors">
+                <button
+                  onClick={() => setExportModalData(null)}
+                  className="px-5 py-3 rounded-xl text-slate-500 dark:text-slate-400 font-bold uppercase tracking-widest text-xs hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  onClick={confirmExportSelection}
+                  disabled={selectedExportDisciplines.size === 0}
+                  className="px-6 py-3 bg-indigo-600 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-md shadow-indigo-900/20 hover:bg-indigo-700 dark:hover:bg-indigo-500 transition-all disabled:opacity-50 disabled:shadow-none flex items-center gap-2"
+                >
+                  <FileSpreadsheet size={16} /> Baixar Planilha
                 </button>
               </div>
             </div>
-
-            <div className="p-6 overflow-y-auto flex-1">
-              <div className="flex items-center justify-between mb-4 pb-4 border-b border-slate-100">
-                <span className="text-[10px] font-black tracking-widest uppercase text-slate-500">
-                  {exportModalData.uniqueDisciplines.length} Disciplinas Encontradas
-                </span>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => setSelectedExportDisciplines(new Set(exportModalData.uniqueDisciplines))}
-                    className="text-[9px] font-bold tracking-widest uppercase text-indigo-600 bg-indigo-50 px-2 py-1.5 rounded-md border border-indigo-100 hover:bg-indigo-100 transition-colors"
-                  >
-                    Todas
-                  </button>
-                  <button
-                    onClick={() => setSelectedExportDisciplines(new Set())}
-                    className="text-[9px] font-bold tracking-widest uppercase text-slate-500 bg-slate-50 px-2 py-1.5 rounded-md border border-slate-200 hover:bg-slate-100 transition-colors"
-                  >
-                    Nenhuma
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                {exportModalData.uniqueDisciplines.map(disc => {
-                  const isChecked = selectedExportDisciplines.has(disc);
-                  return (
-                    <label key={disc} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${isChecked ? 'bg-indigo-50 border-indigo-200' : 'bg-white border-slate-200 hover:bg-slate-50'}`}>
-                      <input
-                        type="checkbox"
-                        checked={isChecked}
-                        onChange={() => {
-                          setSelectedExportDisciplines(prev => {
-                            const newSet = new Set(prev);
-                            if (isChecked) newSet.delete(disc);
-                            else newSet.add(disc);
-                            return newSet;
-                          });
-                        }}
-                        className="w-5 h-5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shadow-sm"
-                      />
-                      <span className={`text-sm font-bold uppercase tracking-tight ${isChecked ? 'text-indigo-900' : 'text-slate-600'}`}>{disc}</span>
-                    </label>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-end gap-3 flex-shrink-0">
-              <button
-                onClick={() => setExportModalData(null)}
-                className="px-5 py-3 rounded-xl text-slate-500 font-bold uppercase tracking-widest text-xs hover:bg-slate-200 transition-colors"
-              >
-                Cancelar
-              </button>
-              <button
-                onClick={confirmExportSelection}
-                disabled={selectedExportDisciplines.size === 0}
-                className="px-6 py-3 bg-indigo-600 text-white rounded-xl font-black uppercase tracking-widest text-xs shadow-md shadow-indigo-200 hover:bg-indigo-700 transition-all disabled:opacity-50 disabled:shadow-none flex items-center gap-2"
-              >
-                <FileSpreadsheet size={16} /> Baixar Planilha
-              </button>
-            </div>
           </div>
-        </div>
-      )}
-    </div>
+        )
+      }
+    </div >
   );
 };
 
