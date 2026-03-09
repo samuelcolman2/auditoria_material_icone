@@ -30,7 +30,9 @@ const App = () => {
   const [globalAnoBol, setGlobalAnoBol] = useState(null);
   const [globalPeriodo, setGlobalPeriodo] = useState('Todos');
   const [globalDetalhes, setGlobalDetalhes] = useState(null); // { aluno, loading, data }
-  const [globalDetalhesTab, setGlobalDetalhesTab] = useState('dados'); // 'dados' | 'notas'
+  const [globalDetalhesTab, setGlobalDetalhesTab] = useState('dados'); // 'dados' | 'notas' | 'material'
+  const [globalMaterial, setGlobalMaterial] = useState(null); // { comprou, pago, det }
+  const [loadingGlobalMaterial, setLoadingGlobalMaterial] = useState(false);
   const [copiedField, setCopiedField] = useState(null); // tracks which field was just copied
   const searchDebounceRef = useRef(null);
   const searchInputRef = useRef(null);
@@ -350,6 +352,7 @@ const App = () => {
   const fetchGlobalDetalhes = async (alunoResult) => {
     setGlobalDetalhes({ aluno: alunoResult, loading: true, data: null });
     setGlobalDetalhesTab('dados');
+    setGlobalMaterial(null); // Reseta material anterior
     setGlobalSearchOpen(false);
     setGlobalSearch(alunoResult.nome);
 
@@ -442,6 +445,67 @@ const App = () => {
       }
     } catch (err) {
       setGlobalDetalhes({ aluno: alunoResult, loading: false, data: null, error: 'Erro ao carregar dados.' });
+    }
+  };
+
+  // Carrega informações de material para o aluno global
+  const fetchGlobalMaterial = async (alunoResult) => {
+    setLoadingGlobalMaterial(true);
+    setGlobalMaterial(null);
+    const keywords = ['plataforma', 'material', 'didatico', 'didático', 'apostila', 'livro', 'sistema', 'kit', '1.0'];
+
+    try {
+      // Pega o ID e unidade (priorizando Ativo ou a primeira disponível)
+      const targetUnit = alunoResult.unidades && alunoResult.unidades.length > 0
+        ? (alunoResult.unidades.find(u => alunoResult.unidadeKey === u.unidadeKey) || alunoResult.unidades[0])
+        : { id: alunoResult.id, unidadeKey: alunoResult.unidadeKey };
+
+      const finXml = await callSponteForUnit(targetUnit.unidadeKey, 'GetFinanceiro', `alunoid=${targetUnit.id}`);
+
+      let comprou = false;
+      let pago = false;
+      let det = '';
+
+      if (finXml) {
+        let itens = Array.from(finXml.getElementsByTagName('wsFinanceiro'));
+        if (itens.length === 0) itens = Array.from(finXml.getElementsByTagName('wsFinanceiroDescontos'));
+
+        itens.forEach(item => {
+          const cat = (item.getElementsByTagName('Categoria')[0]?.textContent || '').toLowerCase();
+          const desc = (item.getElementsByTagName('Descricao')[0]?.textContent || '').toLowerCase();
+          const tipoPlano = (item.getElementsByTagName('TipoPlano')[0]?.textContent || '').toLowerCase();
+
+          const parcelas = [...Array.from(item.getElementsByTagName('wsParcela')), ...Array.from(item.getElementsByTagName('wsParcelaDescontos'))];
+
+          const temParcela2026 = parcelas.some(p => {
+            const v = p.getElementsByTagName('Vencimento')[0]?.textContent || '';
+            const dp = p.getElementsByTagName('DataPagamento')[0]?.textContent || '';
+            return v.includes('2026') || dp.includes('2026');
+          });
+
+          if (keywords.some(k => cat.includes(k) || desc.includes(k) || tipoPlano.includes(k))) {
+            if (parcelas.length > 0 && !temParcela2026) return;
+
+            comprou = true;
+            det = item.getElementsByTagName('Categoria')[0]?.textContent || desc || 'Material Didático';
+
+            const estaPago = parcelas.some(p => {
+              const s = (p.getElementsByTagName('SituacaoParcela')[0]?.textContent || '').toLowerCase();
+              const dp = p.getElementsByTagName('DataPagamento')[0]?.textContent;
+              return s === 'quitada' || (dp && dp.length > 5);
+            });
+
+            if (estaPago) pago = true;
+          }
+        });
+      }
+
+      setGlobalMaterial({ comprou, pago, det });
+    } catch (err) {
+      console.error("Erro ao buscar material global", err);
+      setGlobalMaterial({ error: "Erro ao consultar financeiro." });
+    } finally {
+      setLoadingGlobalMaterial(false);
     }
   };
 
@@ -1107,6 +1171,20 @@ const App = () => {
   return (
     <div className={`min-h-screen transition-colors duration-500 ${isDarkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-[#f3f4f6] text-slate-900'} p-4 md:p-8 font-sans antialiased selection:bg-orange-100 relative`}>
 
+      {/* LOGO STICKY (TOP LEFT) - Simplificado: Só a logo */}
+      {viewMode !== 'welcome' && (
+        <div
+          onClick={() => { setViewMode('welcome'); setTurmas([]); setSelectedTurmaId(null); setAlunos([]); }}
+          className="absolute top-4 left-4 md:top-8 md:left-8 z-40 animate-in fade-in slide-in-from-left-4 duration-500 cursor-pointer group"
+        >
+          <img
+            src="https://iconecolegioecurso.com.br/wp-content/uploads/2022/08/xlogo_icone_site.png.pagespeed.ic_.QgXP3GszLC.webp"
+            alt="Logo Ícone"
+            className="w-12 h-12 md:w-16 md:h-16 object-contain drop-shadow-sm group-hover:scale-110 transition-transform duration-500"
+          />
+        </div>
+      )}
+
       {/* BOTÃO DE CONFIGURAÇÕES (TOP RIGHT) */}
       <div className="absolute top-4 right-4 md:top-8 md:right-8 z-40">
         <button
@@ -1348,6 +1426,19 @@ const App = () => {
                 >
                   <GraduationCap size={12} /> Notas
                 </button>
+                {globalDetalhes.aluno.situacao === 'Ativo' && (
+                  <button
+                    onClick={() => {
+                      setGlobalDetalhesTab('material');
+                      if (!globalMaterial) {
+                        fetchGlobalMaterial(globalDetalhes.aluno);
+                      }
+                    }}
+                    className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalDetalhesTab === 'material' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
+                  >
+                    Material
+                  </button>
+                )}
               </div>
             </div>
 
@@ -1437,6 +1528,53 @@ const App = () => {
                           <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.turma}</p>
                         </div>
                       </div>
+                    </div>
+                  </div>
+                ) : null
+              ) : globalDetalhesTab === 'material' ? (
+                loadingGlobalMaterial ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Consultando Financeiro...</p>
+                  </div>
+                ) : globalMaterial?.error ? (
+                  <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">{globalMaterial.error}</div>
+                ) : globalMaterial ? (
+                  <div className="space-y-6">
+                    <div className={`p-8 rounded-[2rem] border flex flex-col items-center text-center transition-all ${globalMaterial.comprou ? 'bg-green-50/50 border-green-100 dark:bg-green-900/10 dark:border-green-800/30' : 'bg-slate-50 border-slate-100 dark:bg-slate-900/50 dark:border-slate-800'}`}>
+                      <div className={`w-20 h-20 rounded-3xl flex items-center justify-center mb-4 shadow-sm transition-all ${globalMaterial.comprou ? 'bg-green-100 text-green-600 dark:bg-green-900/30 dark:text-green-400' : 'bg-slate-200 text-slate-400 dark:bg-slate-800 dark:text-slate-600'}`}>
+                        {globalMaterial.comprou ? <BookCheck size={40} /> : <XCircle size={40} />}
+                      </div>
+
+                      <h4 className={`text-xl font-black uppercase tracking-tight mb-2 ${globalMaterial.comprou ? 'text-green-700 dark:text-green-400' : 'text-slate-500 dark:text-slate-400'}`}>
+                        {globalMaterial.comprou ? 'Material Identificado' : 'Material Não Encontrado'}
+                      </h4>
+
+                      <p className="text-xs font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-6 px-4">
+                        {globalMaterial.comprou
+                          ? `O sistema localizou a aquisição do material de 2026 para este aluno.`
+                          : 'Nenhum registro de compra de material do ano letivo de 2026 foi localizado até o momento.'}
+                      </p>
+
+                      {globalMaterial.comprou && (
+                        <div className="w-full space-y-3">
+                          <div className="bg-white dark:bg-slate-950 p-4 rounded-2xl border border-green-100 dark:border-green-800/20 shadow-sm flex items-center justify-between transition-colors">
+                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Item</span>
+                            <span className="text-xs font-black text-green-700 dark:text-green-400 uppercase">{globalMaterial.det}</span>
+                          </div>
+
+                          <div className="bg-white dark:bg-slate-950 p-4 rounded-2xl border border-green-100 dark:border-green-800/20 shadow-sm flex items-center justify-between transition-colors">
+                            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Status de Pagamento</span>
+                            <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest ${globalMaterial.pago ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-400' : 'bg-orange-100 text-orange-600 dark:bg-orange-900/40 dark:text-orange-400 animate-pulse'}`}>
+                              {globalMaterial.pago ? (
+                                <><CheckCircle size={12} /> Quitada</>
+                              ) : (
+                                <><DollarSign size={12} /> Pendente</>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
                 ) : null
