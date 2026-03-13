@@ -1,6 +1,6 @@
-﻿import React, { useState, useRef, useCallback, useEffect } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as XLSX from 'xlsx';
-import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy, Settings } from 'lucide-react';
+import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy, Settings, Smartphone, MapPin, Pencil, Save } from 'lucide-react';
 
 const App = () => {
   const [loadingTurmas, setLoadingTurmas] = useState(false);
@@ -34,6 +34,9 @@ const App = () => {
   const [globalMaterial, setGlobalMaterial] = useState(null); // { comprou, pago, det }
   const [loadingGlobalMaterial, setLoadingGlobalMaterial] = useState(false);
   const [copiedField, setCopiedField] = useState(null); // tracks which field was just copied
+  const [editingEmail, setEditingEmail] = useState(false);
+  const [newEmailValue, setNewEmailValue] = useState('');
+  const [savingEmail, setSavingEmail] = useState(false);
   const searchDebounceRef = useRef(null);
   const searchInputRef = useRef(null);
 
@@ -173,8 +176,25 @@ const App = () => {
               res.turmaNome = matRecente.getElementsByTagName('NomeTurma')[0]?.textContent || '';
             }
           }
+
+          // Busca a foto do aluno
+          const fotoParams = `&nAlunoID=${res.id}&nResponsavelID=0`;
+          const fotoXml = await callSponteForUnit(res.unidadeKey, 'GetImageApp', fotoParams, true);
+          if (fotoXml) {
+            const fotoTag = fotoXml.getElementsByTagName('wsFotoApp')[0];
+            if (fotoTag) {
+              if (fotoTag.childNodes && fotoTag.childNodes[7] && fotoTag.childNodes[7].textContent.length > 100) {
+                res.foto = `data:image/jpeg;base64,${fotoTag.childNodes[7].textContent}`;
+              } else {
+                const fotoB64Node = fotoTag.getElementsByTagName('FotoB64')[0];
+                if (fotoB64Node && fotoB64Node.textContent.length > 100) {
+                  res.foto = `data:image/jpeg;base64,${fotoB64Node.textContent}`;
+                }
+              }
+            }
+          }
         } catch (e) {
-          console.error("Erro ao buscar turma para pesquisa global", e);
+          console.error("Erro ao buscar turma/foto para pesquisa global", e);
         }
       }
     }));
@@ -429,6 +449,9 @@ const App = () => {
         }
 
         const matricula = alunoNode.getElementsByTagName('NumeroMatricula')[0]?.textContent || alunoNode.getElementsByTagName('RA')[0]?.textContent || '';
+        const fotoUrl = await fetchFotoAluno(primeiraUnidade.id, primeiraUnidade.unidadeKey);
+        const responsaveis = await fetchResponsaveisAluno(alunoNode, primeiraUnidade.unidadeKey);
+
         setGlobalDetalhes({
           aluno: alunoResult,
           loading: false,
@@ -437,7 +460,16 @@ const App = () => {
             dataNascimento: dataNasc || '--',
             cpf: alunoNode.getElementsByTagName('CPF')[0]?.textContent || '--',
             email: alunoNode.getElementsByTagName('Email')[0]?.textContent || '--',
+            celular: alunoNode.getElementsByTagName('TelefoneCelular')[0]?.textContent || alunoNode.getElementsByTagName('Celular')[0]?.textContent || '--',
+            cep: alunoNode.getElementsByTagName('CEP')[0]?.textContent || '--',
+            endereco: alunoNode.getElementsByTagName('Endereco')[0]?.textContent || '--',
+            numeroEndereco: alunoNode.getElementsByTagName('NumeroEndereco')[0]?.textContent || '--',
+            complemento: alunoNode.getElementsByTagName('ComplementoEndereco')[0]?.textContent || '--',
+            bairro: alunoNode.getElementsByTagName('Bairro')[0]?.textContent || '--',
+            cidade: alunoNode.getElementsByTagName('Cidade')[0]?.textContent || '--',
             turma: turmaNome || 'Não informado',
+            foto: fotoUrl,
+            responsaveis: responsaveis
           }
         });
       } else {
@@ -618,6 +650,42 @@ const App = () => {
     setGlobalPeriodo('Todos');
   };
 
+  // Helper para buscar responsáveis detalhados
+  const fetchResponsaveisAluno = async (alunoNode, unidadeKey = null) => {
+    try {
+      const respTags = Array.from(alunoNode.getElementsByTagName('wsResponsaveis'));
+      const list = respTags.map(r => ({
+        id: r.getElementsByTagName('ResponsavelID')[0]?.textContent,
+        nome: r.getElementsByTagName('Nome')[0]?.textContent,
+        parentesco: r.getElementsByTagName('Parentesco')[0]?.textContent
+      })).filter(r => r && r.id && r.id !== '0');
+
+      const responsaveisDetalhados = await Promise.all(list.map(async (r) => {
+        let xml;
+        if (unidadeKey) {
+          xml = await callSponteForUnit(unidadeKey, 'GetResponsaveis', `ResponsavelID=${r.id}`);
+        } else {
+          xml = await callSponteXhr('GetResponsaveis', `ResponsavelID=${r.id}`);
+        }
+        
+        if (xml) {
+          const wsr = xml.getElementsByTagName('wsResponsavel')[0];
+          if (wsr) {
+            r.email = wsr.getElementsByTagName('Email')[0]?.textContent || '--';
+            r.telefone = wsr.getElementsByTagName('Telefone')[0]?.textContent || '--';
+            r.celular = wsr.getElementsByTagName('Celular')[0]?.textContent || '--';
+            r.cpf = wsr.getElementsByTagName('CPFCNPJ')[0]?.textContent || '--';
+          }
+        }
+        return r;
+      }));
+      return responsaveisDetalhados;
+    } catch (e) {
+      console.error("Erro ao buscar detalhes dos responsáveis", e);
+      return [];
+    }
+  };
+
   // Função genérica de Request
   const callSponteXhr = (method, params, isRawQuery = false) => {
     return new Promise((resolve, reject) => {
@@ -646,6 +714,118 @@ const App = () => {
       xhr.onerror = () => resolve(null); // Falha de rede não quebra o fluxo
       xhr.send();
     });
+  };
+
+  // Helper para buscar foto do aluno
+  const fetchFotoAluno = async (alunoId, unidadeKey = null) => {
+    try {
+      const isRaw = true;
+      const params = `&nAlunoID=${alunoId}&nResponsavelID=0`;
+      let xml;
+      if (unidadeKey) {
+        xml = await callSponteForUnit(unidadeKey, 'GetImageApp', params, isRaw);
+      } else {
+        xml = await callSponteXhr('GetImageApp', params, isRaw);
+      }
+      
+      if (xml) {
+        const fotoTag = xml.getElementsByTagName('wsFotoApp')[0];
+        if (fotoTag) {
+          if (fotoTag.childNodes && fotoTag.childNodes[7] && fotoTag.childNodes[7].textContent.length > 100) {
+            return `data:image/jpeg;base64,${fotoTag.childNodes[7].textContent}`;
+          }
+          const fotoB64Node = fotoTag.getElementsByTagName('FotoB64')[0];
+          if (fotoB64Node && fotoB64Node.textContent.length > 100) {
+            return `data:image/jpeg;base64,${fotoB64Node.textContent}`;
+          }
+        }
+      }
+    } catch (e) {
+      console.error("Erro ao buscar foto", e);
+    }
+    return null;
+  };
+
+  const handleUpdateEmail = async (aluno, unidadeKey, isGlobal) => {
+    if (!newEmailValue) return;
+    setSavingEmail(true);
+    try {
+      const config = UNIDADES_CONFIG[unidadeKey || selectedUnidade];
+      const url = `https://api.sponteeducacional.net.br/WSAPIEdu.asmx/UpdateAlunos3`;
+      
+      const payload = {
+        nCodigoCliente: config.codigo,
+        sToken: config.token,
+        nAlunoID: aluno.id,
+        sNome: aluno.nome || '',
+        sEmail: newEmailValue.trim(),
+        sMidia: '',
+        dDataNascimento: '',
+        sCidade: '',
+        sBairro: '',
+        sCEP: '',
+        sEndereco: '',
+        nNumeroEndereco: '',
+        sComplementoEndereco: '',
+        sCPF: '',
+        sRG: '',
+        nResponsavelFinanceiroID: '0',
+        nResponsavelDidaticoID: '0',
+        sTelefone: '',
+        sCelular: '',
+        sObservacao: '',
+        sSexo: '',
+        sProfissao: '',
+        sCidadeNatal: '',
+        sRa: '',
+        sNumeroMatricula: '',
+        sSituacao: '',
+        sCursoInteresse: '',
+        sInfoBloqueada: '',
+        sOrigemNome: '',
+        nOrigemID: '0'
+      };
+
+      const formData = new URLSearchParams();
+      Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
+
+      console.log("Atualizando e-mail no Sponte...", payload);
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: formData.toString()
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("Erro na resposta do Sponte:", errText);
+        throw new Error(`HTTP ${response.status}: ${errText.substring(0, 100)}`);
+      }
+
+      const xmlText = await response.text();
+      const parser = new DOMParser();
+      const xml = parser.parseFromString(xmlText, 'text/xml');
+      const retorno = xml.getElementsByTagName('RetornoOperacao')[0]?.textContent || '';
+      
+      if (retorno && retorno.toLowerCase().includes('erro')) {
+         console.warn("Retorno da API indica possível erro:", retorno);
+      }
+
+      if (isGlobal) {
+        setGlobalDetalhes(prev => ({ ...prev, data: { ...prev.data, email: newEmailValue.trim() }}));
+      } else {
+        setSelectedAlunoDetails(prev => ({ ...prev, email: newEmailValue.trim() }));
+      }
+      setEditingEmail(false);
+    } catch (e) {
+      console.error("Erro ao atualizar o email", e);
+      alert("Não foi possível atualizar o e-mail: " + e.message);
+    } finally {
+      setSavingEmail(false);
+    }
   };
 
   // 1. Carregar Turmas de 2026
@@ -1059,13 +1239,25 @@ const App = () => {
 
       if (!alunoNode) throw new Error("Detalhes não encontrados.");
 
+      const fotoUrl = await fetchFotoAluno(aluno.id);
+      const responsaveis = await fetchResponsaveisAluno(alunoNode);
+
       const detalhes = {
         ...aluno,
         dataNascimento: alunoNode.getElementsByTagName('DataNascimento')[0]?.textContent || '--',
         cpf: alunoNode.getElementsByTagName('CPF')[0]?.textContent || '--',
         email: alunoNode.getElementsByTagName('Email')[0]?.textContent || '--',
+        celular: alunoNode.getElementsByTagName('TelefoneCelular')[0]?.textContent || alunoNode.getElementsByTagName('Celular')[0]?.textContent || '--',
+        cep: alunoNode.getElementsByTagName('CEP')[0]?.textContent || '--',
+        endereco: alunoNode.getElementsByTagName('Endereco')[0]?.textContent || '--',
+        numeroEndereco: alunoNode.getElementsByTagName('NumeroEndereco')[0]?.textContent || '--',
+        complemento: alunoNode.getElementsByTagName('ComplementoEndereco')[0]?.textContent || '--',
+        bairro: alunoNode.getElementsByTagName('Bairro')[0]?.textContent || '--',
+        cidade: alunoNode.getElementsByTagName('Cidade')[0]?.textContent || '--',
         matricula: alunoNode.getElementsByTagName('NumeroMatricula')[0]?.textContent || alunoNode.getElementsByTagName('RA')[0]?.textContent || aluno.id,
         turma: (turmas.find(t => t.id === selectedTurmaId)?.nome) || 'Não informado',
+        foto: fotoUrl,
+        responsaveis: responsaveis,
         loading: false
       };
 
@@ -1374,9 +1566,13 @@ const App = () => {
               <div className="absolute top-0 right-0 w-32 h-32 bg-white/5 rounded-full blur-2xl -translate-y-1/2 translate-x-1/2 pointer-events-none"></div>
               <div className="relative z-10 flex items-start justify-between">
                 <div className="flex items-center gap-4">
-                  <div className="w-12 h-12 rounded-2xl bg-green-500 flex items-center justify-center font-black text-lg text-white shadow-lg shadow-green-900/20">
-                    {globalDetalhes.aluno.nome.charAt(0)}
-                  </div>
+                  {globalDetalhes.data?.foto ? (
+                    <img src={globalDetalhes.data.foto} alt="Foto" className="w-12 h-12 rounded-2xl object-cover shadow-lg shadow-green-900/20" />
+                  ) : (
+                    <div className="w-12 h-12 rounded-2xl bg-green-500 flex items-center justify-center font-black text-lg text-white shadow-lg shadow-green-900/20">
+                      {globalDetalhes.aluno.nome.charAt(0)}
+                    </div>
+                  )}
                   <div className="flex flex-col">
                     <div
                       className="cursor-pointer group/name relative inline-block self-start"
@@ -1408,7 +1604,7 @@ const App = () => {
                 </div>
               </div>
               {/* Tabs: Dados | Notas */}
-              <div className="flex gap-2 mt-5">
+              <div className="flex flex-wrap gap-2 mt-5">
                 <button
                   onClick={() => setGlobalDetalhesTab('dados')}
                   className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${globalDetalhesTab === 'dados' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
@@ -1439,6 +1635,18 @@ const App = () => {
                     Material
                   </button>
                 )}
+                <button
+                  onClick={() => setGlobalDetalhesTab('endereco')}
+                  className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-1.5 ${globalDetalhesTab === 'endereco' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
+                >
+                  <MapPin size={12} /> Endereço
+                </button>
+                <button
+                  onClick={() => setGlobalDetalhesTab('responsaveis')}
+                  className={`px-5 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-1.5 ${globalDetalhesTab === 'responsaveis' ? 'bg-orange-500 text-white shadow-md' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}
+                >
+                  <Users size={12} /> Responsáveis
+                </button>
               </div>
             </div>
 
@@ -1505,20 +1713,90 @@ const App = () => {
                       </div>
 
                       <div
-                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 cursor-pointer transition-colors group"
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-blue-100 cursor-pointer transition-colors group relative"
                         onClick={() => {
+                          if (editingEmail) return;
                           navigator.clipboard.writeText(globalDetalhes.data.email || '');
                           setCopiedField('email');
                           setTimeout(() => setCopiedField(null), 2000);
                         }}
                       >
                         <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center text-blue-500 group-hover:bg-blue-500 group-hover:text-white transition-colors"><div className="scale-75"><User size={20} /></div></div>
-                        <div className="overflow-hidden flex-1">
+                        <div className="overflow-hidden flex-1 pr-24">
                           <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5 flex items-center justify-between">
                             Email
                             {copiedField === 'email' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
                           </p>
-                          <p className="font-bold text-slate-700 text-sm truncate group-hover:text-blue-600 transition-colors">{globalDetalhes.data.email}</p>
+                          {editingEmail ? (
+                            <div className="flex items-center gap-2 mt-1" onClick={e => e.stopPropagation()}>
+                              <input 
+                                type="email" 
+                                className="w-full text-sm font-bold text-slate-700 bg-white border border-slate-300 rounded px-2 py-1 outline-none focus:border-blue-500"
+                                value={newEmailValue}
+                                onChange={e => setNewEmailValue(e.target.value)}
+                                autoFocus
+                              />
+                              <button 
+                                onClick={() => handleUpdateEmail(globalDetalhes.aluno, globalDetalhes.aluno.unidadeKey || globalDetalhes.aluno.unidades?.[0]?.unidadeKey, true)}
+                                disabled={savingEmail}
+                                className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50"
+                              >
+                                {savingEmail ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                              </button>
+                              <button 
+                                onClick={() => setEditingEmail(false)}
+                                className="p-1.5 bg-slate-200 text-slate-600 rounded hover:bg-slate-300 disabled:opacity-50"
+                              >
+                                <XCircle size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="font-bold text-slate-700 text-sm truncate group-hover:text-blue-600 transition-colors">{globalDetalhes.data.email}</p>
+                          )}
+                        </div>
+                        {!editingEmail && (
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                            {globalDetalhes.data.email && globalDetalhes.data.email !== '--' && (
+                              <a 
+                                href={`https://admin.google.com/u/2/ac/search?query=${globalDetalhes.data.email}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="px-2.5 py-1.5 bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-600 rounded-lg text-[9px] font-black uppercase tracking-widest transition-colors shadow-sm"
+                              >
+                                Admin
+                              </a>
+                            )}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setNewEmailValue(globalDetalhes.data.email !== '--' ? globalDetalhes.data.email : '');
+                                setEditingEmail(true);
+                              }}
+                              className="p-1.5 bg-slate-100 hover:bg-blue-50 text-slate-500 hover:text-blue-600 rounded-lg transition-colors shadow-sm"
+                              title="Editar E-mail"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-green-100 cursor-pointer transition-colors group"
+                        onClick={() => {
+                          navigator.clipboard.writeText(globalDetalhes.data.celular || '');
+                          setCopiedField('celular');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="w-10 h-10 rounded-xl bg-green-50 flex items-center justify-center text-green-500 group-hover:bg-green-500 group-hover:text-white transition-colors"><Smartphone size={18} /></div>
+                        <div className="flex-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            Celular
+                            {copiedField === 'celular' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 text-sm group-hover:text-green-600 transition-colors">{globalDetalhes.data.celular}</p>
                         </div>
                       </div>
                       <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100">
@@ -1531,6 +1809,87 @@ const App = () => {
                     </div>
                   </div>
                 ) : null
+              ) : globalDetalhesTab === 'endereco' ? (
+                globalDetalhes.loading ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando Informações...</p>
+                  </div>
+                ) : globalDetalhes.error ? (
+                  <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">{globalDetalhes.error}</div>
+                ) : globalDetalhes.data ? (
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5"><MapPin size={10} /> CEP</p>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.cep}</p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5"><Building2 size={10} /> Cidade / UF</p>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.cidade}</p>
+                      </div>
+                    </div>
+                    
+                    <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100 flex items-start gap-4">
+                      <div className="w-10 h-10 rounded-xl bg-slate-200 flex items-center justify-center text-slate-500 flex-shrink-0"><MapPin size={18} /></div>
+                      <div>
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Logradouro</p>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.endereco || '--'}, Nº {globalDetalhes.data.numeroEndereco || 'S/N'}</p>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Complemento</p>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.complemento || '--'}</p>
+                      </div>
+                      <div className="p-4 bg-slate-50 rounded-2xl border border-slate-100">
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Bairro</p>
+                        <p className="font-bold text-slate-700 text-sm">{globalDetalhes.data.bairro || '--'}</p>
+                      </div>
+                    </div>
+                  </div>
+                ) : null
+              ) : globalDetalhesTab === 'responsaveis' ? (
+                globalDetalhes.loading ? (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Loader2 size={32} className="animate-spin text-orange-500" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Buscando Informações...</p>
+                  </div>
+                ) : globalDetalhes.error ? (
+                  <div className="p-4 bg-red-50 text-red-600 rounded-xl text-xs font-bold text-center">{globalDetalhes.error}</div>
+                ) : globalDetalhes.data?.responsaveis?.length > 0 ? (
+                  <div className="space-y-4">
+                    {globalDetalhes.data.responsaveis.map((resp, idx) => (
+                      <div key={idx} className="p-5 bg-slate-50 flex flex-col gap-4 rounded-2xl border border-slate-100 transition-colors">
+                        <div className="flex items-center gap-4">
+                          <div className="w-12 h-12 rounded-xl bg-orange-50 flex items-center justify-center text-orange-500 group-hover:bg-orange-500 group-hover:text-white transition-colors flex-shrink-0">
+                            <Users size={20} />
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-0.5">{resp.parentesco}</p>
+                            <p className="font-bold text-slate-700 text-base leading-tight">{resp.nome}</p>
+                          </div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4 pt-4 border-t border-slate-200/50">
+                          <div>
+                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5">Email</p>
+                            <p className="font-bold text-slate-700 text-sm truncate" title={resp.email}>{resp.email}</p>
+                          </div>
+                          <div>
+                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1 flex items-center gap-1.5">Contato</p>
+                            <p className="font-bold text-slate-700 text-sm truncate" title={resp.celular !== '--' ? resp.celular : resp.telefone}>{resp.celular !== '--' ? resp.celular : resp.telefone}</p>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
+                    <Users size={32} className="opacity-50" />
+                    <p className="text-[10px] font-black uppercase tracking-widest">Nenhum Responsável Encontrado</p>
+                  </div>
+                )
               ) : globalDetalhesTab === 'material' ? (
                 loadingGlobalMaterial ? (
                   <div className="py-12 flex flex-col items-center gap-4 text-slate-400">
@@ -1853,9 +2212,13 @@ const App = () => {
 
                 <div className="relative z-10 flex items-start justify-between">
                   <div className="flex items-center gap-4">
-                    <div className={`w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg transition-all ${selectedAlunoDetails.material?.comprou ? 'bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 border border-slate-300 dark:border-slate-700'}`}>
-                      {selectedAlunoDetails.nome.charAt(0)}
-                    </div>
+                    {selectedAlunoDetails.foto ? (
+                      <img src={selectedAlunoDetails.foto} alt="Foto" className={`w-12 h-12 rounded-2xl object-cover shadow-lg transition-all ${selectedAlunoDetails.material?.comprou ? 'shadow-green-900/20' : ''}`} />
+                    ) : (
+                      <div className={`w-12 h-12 rounded-2xl flex items-center justify-center font-black text-lg transition-all ${selectedAlunoDetails.material?.comprou ? 'bg-green-500 text-white shadow-lg shadow-green-900/20' : 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 border border-slate-300 dark:border-slate-700'}`}>
+                        {selectedAlunoDetails.nome.charAt(0)}
+                      </div>
+                    )}
                     <div
                       className="cursor-pointer group/name relative"
                       onClick={() => {
@@ -1948,8 +2311,9 @@ const App = () => {
                       </div>
 
                       <div
-                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-blue-100 dark:hover:border-blue-900 transition-colors group cursor-pointer"
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-blue-100 dark:hover:border-blue-900 transition-colors group cursor-pointer relative"
                         onClick={() => {
+                          if (editingEmail) return;
                           navigator.clipboard.writeText(selectedAlunoDetails.email || '');
                           setCopiedField('email_details');
                           setTimeout(() => setCopiedField(null), 2000);
@@ -1958,12 +2322,83 @@ const App = () => {
                         <div className="w-10 h-10 rounded-xl bg-blue-50 dark:bg-blue-900/20 flex items-center justify-center text-blue-500 dark:text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-colors">
                           <div className="scale-75"><User size={20} /></div>
                         </div>
-                        <div className="overflow-hidden flex-1">
+                        <div className="overflow-hidden flex-1 pr-24">
                           <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5 flex items-center justify-between">
                             Email
                             {copiedField === 'email_details' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
                           </p>
-                          <p className="font-bold text-slate-700 dark:text-slate-200 text-sm truncate w-full group-hover:text-blue-600 transition-colors">{selectedAlunoDetails.email}</p>
+                          {editingEmail ? (
+                            <div className="flex items-center gap-2 mt-1" onClick={e => e.stopPropagation()}>
+                              <input 
+                                type="email" 
+                                className="w-full text-sm font-bold text-slate-700 bg-white border border-slate-300 rounded px-2 py-1 outline-none focus:border-blue-500"
+                                value={newEmailValue}
+                                onChange={e => setNewEmailValue(e.target.value)}
+                                autoFocus
+                              />
+                              <button 
+                                onClick={() => handleUpdateEmail(selectedAlunoDetails, selectedUnidade, false)}
+                                disabled={savingEmail}
+                                className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50"
+                              >
+                                {savingEmail ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                              </button>
+                              <button 
+                                onClick={() => setEditingEmail(false)}
+                                className="p-1.5 bg-slate-200 text-slate-600 rounded hover:bg-slate-300 disabled:opacity-50"
+                              >
+                                <XCircle size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="font-bold text-slate-700 dark:text-slate-200 text-sm truncate w-full group-hover:text-blue-600 transition-colors">{selectedAlunoDetails.email}</p>
+                          )}
+                        </div>
+                        {!editingEmail && (
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                            {selectedAlunoDetails.email && selectedAlunoDetails.email !== '--' && (
+                              <a 
+                                href={`https://admin.google.com/u/2/ac/search?query=${selectedAlunoDetails.email}`} 
+                                target="_blank" 
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="px-2.5 py-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 rounded-lg text-[9px] font-black uppercase tracking-widest transition-colors shadow-sm"
+                              >
+                                Admin
+                              </a>
+                            )}
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setNewEmailValue(selectedAlunoDetails.email !== '--' ? selectedAlunoDetails.email : '');
+                                setEditingEmail(true);
+                              }}
+                              className="p-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 rounded-lg transition-colors shadow-sm"
+                              title="Editar E-mail"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+
+                      <div
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-green-100 dark:hover:border-green-900 transition-colors group cursor-pointer"
+                        onClick={() => {
+                          navigator.clipboard.writeText(selectedAlunoDetails.celular || '');
+                          setCopiedField('celular_details');
+                          setTimeout(() => setCopiedField(null), 2000);
+                        }}
+                      >
+                        <div className="w-10 h-10 rounded-xl bg-green-50 dark:bg-green-900/20 flex items-center justify-center text-green-500 dark:text-green-400 group-hover:bg-green-500 group-hover:text-white transition-colors">
+                          <Smartphone size={18} />
+                        </div>
+                        <div className="flex-1">
+                          <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5 flex items-center justify-between">
+                            Celular
+                            {copiedField === 'celular_details' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
+                          </p>
+                          <p className="font-bold text-slate-700 dark:text-slate-200 text-sm group-hover:text-green-600 transition-colors">{selectedAlunoDetails.celular}</p>
                         </div>
                       </div>
 
@@ -1975,6 +2410,79 @@ const App = () => {
                           <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Turma Atual</p>
                           <p className="font-bold text-slate-700 dark:text-slate-200 text-sm">{selectedAlunoDetails.turma}</p>
                         </div>
+                      </div>
+
+                      <div className="p-4 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 transition-colors">
+                        <div className="flex items-center gap-2 mb-3">
+                          <MapPin size={14} className="text-slate-400" />
+                          <h4 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Endereço Completo</h4>
+                        </div>
+                        <div className="space-y-3">
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">CEP</p>
+                              <p className="font-bold text-slate-700 dark:text-slate-200 text-xs">{selectedAlunoDetails.cep}</p>
+                            </div>
+                            <div>
+                              <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Cidade</p>
+                              <p className="font-bold text-slate-700 dark:text-slate-200 text-xs">{selectedAlunoDetails.cidade}</p>
+                            </div>
+                          </div>
+                          <div>
+                            <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Logradouro</p>
+                            <p className="font-bold text-slate-700 dark:text-slate-200 text-xs">{selectedAlunoDetails.endereco || '--'}, Nº {selectedAlunoDetails.numeroEndereco || 'S/N'}</p>
+                          </div>
+                          <div className="grid grid-cols-2 gap-3">
+                            <div>
+                              <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Complemento</p>
+                              <p className="font-bold text-slate-700 dark:text-slate-200 text-xs">{selectedAlunoDetails.complemento || '--'}</p>
+                            </div>
+                            <div>
+                              <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Bairro</p>
+                              <p className="font-bold text-slate-700 dark:text-slate-200 text-xs">{selectedAlunoDetails.bairro || '--'}</p>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="p-4 bg-slate-50 dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 transition-colors">
+                        <div className="flex items-center gap-2 mb-4">
+                          <Users size={14} className="text-slate-400" />
+                          <h4 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest">Responsáveis</h4>
+                        </div>
+                        
+                        {selectedAlunoDetails.responsaveis?.length > 0 ? (
+                          <div className="space-y-4 divide-y divide-slate-100 dark:divide-slate-800/60">
+                            {selectedAlunoDetails.responsaveis.map((resp, idx) => (
+                              <div key={idx} className="pt-4 first:pt-0 flex flex-col gap-3">
+                                <div className="flex items-center gap-3">
+                                  <div className="w-8 h-8 rounded-lg bg-orange-50 dark:bg-orange-900/20 flex items-center justify-center text-orange-500 dark:text-orange-400">
+                                    <Users size={14} />
+                                  </div>
+                                  <div>
+                                    <p className="text-[8px] font-black text-orange-500 uppercase tracking-widest mb-0.5">{resp.parentesco}</p>
+                                    <p className="font-bold text-slate-700 dark:text-slate-200 text-sm leading-tight">{resp.nome}</p>
+                                  </div>
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 pl-[44px]">
+                                  <div>
+                                    <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Email</p>
+                                    <p className="font-bold text-slate-600 dark:text-slate-300 text-[10px] truncate" title={resp.email}>{resp.email}</p>
+                                  </div>
+                                  <div>
+                                    <p className="text-[8px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5">Contato</p>
+                                    <p className="font-bold text-slate-600 dark:text-slate-300 text-[10px] truncate" title={resp.celular !== '--' ? resp.celular : resp.telefone}>{resp.celular !== '--' ? resp.celular : resp.telefone}</p>
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="py-6 flex flex-col items-center gap-3 text-slate-400 dark:text-slate-600">
+                            <Users size={24} className="opacity-50" />
+                            <p className="text-[9px] font-black uppercase tracking-widest">Nenhum Responsável</p>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -2382,9 +2890,13 @@ const App = () => {
                         className="w-full text-left px-4 sm:px-5 py-3.5 hover:bg-orange-50 dark:hover:bg-orange-950/20 transition-colors flex items-center justify-between border-b border-slate-100 dark:border-slate-800 last:border-0 group"
                       >
                         <button onClick={() => fetchGlobalDetalhes(result)} className="flex-1 flex items-center gap-3 text-left overflow-hidden">
-                          <div className="w-8 h-8 rounded-xl bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 flex items-center justify-center font-black text-sm flex-shrink-0">
-                            {result.nome.charAt(0)}
-                          </div>
+                          {result.foto ? (
+                            <img src={result.foto} alt="Foto" className="w-8 h-8 rounded-xl object-cover shadow-sm flex-shrink-0" />
+                          ) : (
+                            <div className="w-8 h-8 rounded-xl bg-orange-100 dark:bg-orange-900/30 text-orange-600 dark:text-orange-400 flex items-center justify-center font-black text-sm flex-shrink-0">
+                              {result.nome.charAt(0)}
+                            </div>
+                          )}
                           <div className="min-w-0 pr-2">
                             <div className="flex items-center gap-2 overflow-hidden">
                               <p className="font-bold text-sm text-slate-800 dark:text-slate-200 group-hover:text-orange-600 dark:group-hover:text-orange-400 truncate transition-colors">{result.nome}</p>
@@ -2400,11 +2912,11 @@ const App = () => {
                             {result.unidades && result.unidades.length > 0 ? (
                               <div className="flex flex-wrap gap-1 mt-1">
                                 {result.unidades.map(u => (
-                                  <span key={u.unidadeKey} className="text-[9px] font-black uppercase tracking-widest text-orange-400 bg-orange-50 dark:bg-orange-900/20 px-1.5 py-0.5 rounded border border-orange-100 dark:border-orange-800 whitespace-nowrap truncate max-w-full">{u.unidadeNome}</span>
+                                  <span key={u.unidadeKey} className={`text-[9px] font-black uppercase tracking-widest px-1.5 py-0.5 rounded border whitespace-nowrap truncate max-w-full ${u.unidadeKey === result.unidadeKey ? 'text-white bg-orange-500 border-orange-600 shadow-md' : 'text-orange-400 bg-orange-50 dark:bg-orange-900/20 border-orange-100 dark:border-orange-800'}`}>{u.unidadeNome}</span>
                                 ))}
                               </div>
                             ) : (
-                              <p className="text-[9px] font-black uppercase tracking-widest text-orange-400 mt-0.5 truncate">{result.unidadeNome}</p>
+                              <p className="text-[9px] font-black uppercase tracking-widest text-white bg-orange-500 border border-orange-600 px-1.5 py-0.5 rounded shadow-md mt-0.5 truncate w-fit">{result.unidadeNome}</p>
                             )}
                           </div>
                         </button>
