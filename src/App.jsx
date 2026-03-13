@@ -1,6 +1,15 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as XLSX from 'xlsx';
 import { Search, Calendar, User, CheckCircle, Loader2, AlertCircle, Play, GraduationCap, Users, LayoutList, ChevronDown, School, Building2, BookCheck, XCircle, DollarSign, Filter, RefreshCw, FileSpreadsheet, Globe, Plus, Copy, Settings, Smartphone, MapPin, Pencil, Save } from 'lucide-react';
+// Configuração das unidades (Uso Local via .env)
+const UNIDADES_CONFIG = {
+  unidade_1: { nome: 'Unidade 1 - Ícone Taquara 1', codigo: import.meta.env.VITE_UNIDADE_1_CODIGO, token: import.meta.env.VITE_UNIDADE_1_TOKEN },
+  unidade_2: { nome: 'Unidade 2 - Ícone Taquara 2', codigo: import.meta.env.VITE_UNIDADE_2_CODIGO, token: import.meta.env.VITE_UNIDADE_2_TOKEN },
+  unidade_3: { nome: 'Unidade 3 - Ícone Taquara 3', codigo: import.meta.env.VITE_UNIDADE_3_CODIGO, token: import.meta.env.VITE_UNIDADE_3_TOKEN },
+  unidade_4: { nome: 'Unidade 4 - Ícone Taquara 4', codigo: import.meta.env.VITE_UNIDADE_4_CODIGO, token: import.meta.env.VITE_UNIDADE_4_TOKEN },
+  unidade_5: { nome: 'Unidade 5 - Ícone Taquara 5', codigo: import.meta.env.VITE_UNIDADE_5_CODIGO, token: import.meta.env.VITE_UNIDADE_5_TOKEN },
+  unidade_6: { nome: 'Unidade 6 - Ícone Taquara 6', codigo: import.meta.env.VITE_UNIDADE_6_CODIGO, token: import.meta.env.VITE_UNIDADE_6_TOKEN }
+};
 
 const App = () => {
   const [loadingTurmas, setLoadingTurmas] = useState(false);
@@ -37,6 +46,9 @@ const App = () => {
   const [editingEmail, setEditingEmail] = useState(false);
   const [newEmailValue, setNewEmailValue] = useState('');
   const [savingEmail, setSavingEmail] = useState(false);
+  const [editingPhone, setEditingPhone] = useState(false); // Novo: Edição de Celular
+  const [newPhoneValue, setNewPhoneValue] = useState(''); // Novo: Edição de Celular
+  const [savingPhone, setSavingPhone] = useState(false); // Novo: Edição de Celular
   const searchDebounceRef = useRef(null);
   const searchInputRef = useRef(null);
 
@@ -69,20 +81,11 @@ const App = () => {
     }
   }, [isDarkMode]);
 
-  // Configuração das unidades (Tokens e Códigos agora estão no Backend)
-  // Configuração das unidades
-  const UNIDADES_CONFIG = {
-    unidade_1: { nome: 'Unidade 1 - Ícone Taquara 1', codigo: import.meta.env.VITE_UNIDADE_1_CODIGO, token: import.meta.env.VITE_UNIDADE_1_TOKEN },
-    unidade_2: { nome: 'Unidade 2 - Ícone Taquara 2', codigo: import.meta.env.VITE_UNIDADE_2_CODIGO, token: import.meta.env.VITE_UNIDADE_2_TOKEN },
-    unidade_3: { nome: 'Unidade 3 - Ícone Taquara 3', codigo: import.meta.env.VITE_UNIDADE_3_CODIGO, token: import.meta.env.VITE_UNIDADE_3_TOKEN },
-    unidade_4: { nome: 'Unidade 4 - Ícone Taquara 4', codigo: import.meta.env.VITE_UNIDADE_4_CODIGO, token: import.meta.env.VITE_UNIDADE_4_TOKEN },
-    unidade_5: { nome: 'Unidade 5 - Ícone Taquara 5', codigo: import.meta.env.VITE_UNIDADE_5_CODIGO, token: import.meta.env.VITE_UNIDADE_5_TOKEN },
-    unidade_6: { nome: 'Unidade 6 - Ícone Taquara 6', codigo: import.meta.env.VITE_UNIDADE_6_CODIGO, token: import.meta.env.VITE_UNIDADE_6_TOKEN }
-  };
 
-  // Helper: chamada Sponte para qualquer unidade (não depende de selectedUnidade)
+  // Helper: chamada Sponte para qualquer unidade
   const callSponteForUnit = useCallback((unidadeKey, method, params, isRaw = false) => {
     const config = UNIDADES_CONFIG[unidadeKey];
+    if (!config) return Promise.resolve(null);
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
       let url = `https://api.sponteeducacional.net.br/WSAPIEdu.asmx/${method}?nCodigoCliente=${config.codigo}&sToken=${config.token}`;
@@ -108,24 +111,54 @@ const App = () => {
 
     // Precisamos enviar um termo príncipal para a API. Pegamos a primeira palavra com 3+ letras, ou a 1ª palavra.
     const apiSearchTerm = searchTerms.find(t => t.length >= 3) || searchTerms[0];
+    const isPotentialEmail = query.includes('@');
+    const isPotentialMatricula = /^\d+$/.test(query.trim());
 
     await Promise.all(unidades.map(async (uKey) => {
-      const xml = await callSponteForUnit(uKey, 'GetAlunos', `nome=${encodeURIComponent(apiSearchTerm)}`);
-      if (!xml) return;
-      const nodes = Array.from(xml.getElementsByTagName('wsAluno'));
-      nodes.forEach(node => {
-        const id = node.getElementsByTagName('AlunoID')[0]?.textContent;
-        const nome = node.getElementsByTagName('Nome')[0]?.textContent;
-        const situacao = node.getElementsByTagName('Situacao')[0]?.textContent || 'Inativo';
-        if (id && id !== '0' && nome) {
-          const nomeNormalizado = removeAccents(nome);
-          // Verifica se TODAS as partes pesquisadas estão no nome do aluno (não importando a ordem ou distância)
-          const matchesAll = searchTerms.every(term => nomeNormalizado.includes(term));
+      const searchPromises = [];
+      
+      // Busca principal por Nome
+      searchPromises.push(callSponteForUnit(uKey, 'GetAlunos', `nome=${encodeURIComponent(apiSearchTerm)}`));
+      
+      // Busca adicional por E-mail
+      if (isPotentialEmail) {
+        searchPromises.push(callSponteForUnit(uKey, 'GetAlunos', `email=${encodeURIComponent(query.trim())}`));
+      }
+      
+      // Busca adicional por Matrícula
+      if (isPotentialMatricula) {
+        searchPromises.push(callSponteForUnit(uKey, 'GetAlunos', `numeroMatricula=${encodeURIComponent(query.trim())}`));
+      }
 
-          if (matchesAll) {
-            results.push({ id, nome, situacao, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
+      const xmls = await Promise.all(searchPromises);
+      
+      xmls.forEach(xml => {
+        if (!xml) return;
+        const nodes = Array.from(xml.getElementsByTagName('wsAluno'));
+        nodes.forEach(node => {
+          const id = node.getElementsByTagName('AlunoID')[0]?.textContent;
+          const nome = node.getElementsByTagName('Nome')[0]?.textContent;
+          const situacao = node.getElementsByTagName('Situacao')[0]?.textContent || 'Inativo';
+          const emailAluno = node.getElementsByTagName('Email')[0]?.textContent || '';
+          const matAluno = node.getElementsByTagName('NumeroMatricula')[0]?.textContent || '';
+
+          if (id && id !== '0' && nome) {
+            const nomeNormalizado = removeAccents(nome);
+            const emailNormalizado = emailAluno.toLowerCase();
+            
+            // Verifica se dá match em qualquer um dos critérios (Nome, Email ou Matrícula)
+            const matchesNome = searchTerms.every(term => nomeNormalizado.includes(term));
+            const matchesEmail = isPotentialEmail && emailNormalizado.includes(query.trim().toLowerCase());
+            const matchesMatricula = isPotentialMatricula && matAluno === query.trim();
+
+            if (matchesNome || matchesEmail || matchesMatricula) {
+              // Evita duplicatas dentro da mesma unidade antes do agrupamento global
+              if (!results.some(r => r.id === id && r.unidadeKey === uKey)) {
+                results.push({ id, nome, situacao, unidadeKey: uKey, unidadeNome: UNIDADES_CONFIG[uKey].nome });
+              }
+            }
           }
-        }
+        });
       });
     }));
 
@@ -167,13 +200,35 @@ const App = () => {
           // Busca matrícula na unidade principal do resultado
           const matXml = await callSponteForUnit(res.unidadeKey, 'GetMatriculas', `alunoid=${res.id}`);
           if (matXml) {
-            const mats = Array.from(matXml.getElementsByTagName('wsMatricula'));
-            // Pega a matrícula de 2026 ou a mais recente
-            const mat2026 = mats.find(m => (m.getElementsByTagName('AnoLetivo')[0]?.textContent || '') === '2026');
-            const matRecente = mat2026 || mats[0];
+            const extractYear = (m) => {
+              const al = m.getElementsByTagName('AnoLetivo')[0]?.textContent || '';
+              if (al && al.length === 4 && al.startsWith('20')) return parseInt(al);
+              const dt = m.getElementsByTagName('DataInicio')[0]?.textContent || m.getElementsByTagName('DataMatricula')[0]?.textContent || '';
+              if (dt.includes('/')) return parseInt(dt.split(' ')[0].split('/')[2]);
+              if (dt.includes('-')) return parseInt(dt.split('T')[0].split('-')[0]);
+              const nome = m.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+              const match = nome.match(/202\d/);
+              return match ? parseInt(match[0]) : 0;
+            };
 
-            if (matRecente) {
-              res.turmaNome = matRecente.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+            const matsWithYear = mats.map(m => ({ node: m, year: extractYear(m) }));
+            const mat2026 = matsWithYear.find(m => m.year === 2026);
+            
+            if (mat2026) {
+              res.turmaNome = mat2026.node.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+            } else if (res.situacao === 'Ativo' && matsWithYear.length > 0) {
+              // Fallback para ativa: pega a de MAIOR ano
+              matsWithYear.sort((a, b) => b.year - a.year);
+              const maisRecente = matsWithYear[0];
+              const nome = maisRecente.node.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+              res.turmaNome = maisRecente.year > 0 ? `${nome} (${maisRecente.year})` : nome;
+            } else if (res.situacao === 'Ativo') {
+              res.turmaNome = 'Sem matrícula identificada';
+            } else if (matsWithYear.length > 0) {
+              matsWithYear.sort((a, b) => b.year - a.year);
+              const mr = matsWithYear[0];
+              const nome = mr.node.getElementsByTagName('NomeTurma')[0]?.textContent || '';
+              res.turmaNome = mr.year > 0 ? `${nome} (${mr.year})` : nome;
             }
           }
 
@@ -439,9 +494,19 @@ const App = () => {
             }));
 
             if (allEnrollments.length > 0) {
-              // Ordena por ano decrescente numericamente
-              allEnrollments.sort((a, b) => b.ano - a.ano);
-              turmaNome = allEnrollments[0].nomeTurma;
+              const enrollments2026 = allEnrollments.filter(e => e.ano === 2026);
+              
+              if (enrollments2026.length > 0) {
+                turmaNome = enrollments2026[0].nomeTurma;
+              } else {
+                // Para ATIVOS, pega a mais recente mesmo que não seja 2026 (fallback de segurança)
+                // Para INATIVOS do mesmo jeito, mas indicando o ano.
+                allEnrollments.sort((a, b) => b.ano - a.ano);
+                const principal = allEnrollments[0];
+                turmaNome = principal.ano > 0 && principal.ano !== 2026 
+                  ? `${principal.nomeTurma} (${principal.ano})` 
+                  : principal.nomeTurma;
+              }
             }
           } catch (e) {
             console.error("Erro ao buscar turma recente", e);
@@ -690,6 +755,7 @@ const App = () => {
   const callSponteXhr = (method, params, isRawQuery = false) => {
     return new Promise((resolve, reject) => {
       const config = UNIDADES_CONFIG[selectedUnidade];
+      if (!config) return resolve(null);
       const xhr = new XMLHttpRequest();
 
       let url = `https://api.sponteeducacional.net.br/WSAPIEdu.asmx/${method}?nCodigoCliente=${config.codigo}&sToken=${config.token}`;
@@ -751,6 +817,7 @@ const App = () => {
     setSavingEmail(true);
     try {
       const config = UNIDADES_CONFIG[unidadeKey || selectedUnidade];
+      if (!config) return;
       const url = `https://api.sponteeducacional.net.br/WSAPIEdu.asmx/UpdateAlunos3`;
       
       const payload = {
@@ -825,6 +892,79 @@ const App = () => {
       alert("Não foi possível atualizar o e-mail: " + e.message);
     } finally {
       setSavingEmail(false);
+    }
+  };
+
+  const handleUpdatePhone = async (aluno, unidadeKey, isGlobal) => {
+    if (!newPhoneValue) return;
+    setSavingPhone(true);
+    try {
+      const config = UNIDADES_CONFIG[unidadeKey || selectedUnidade];
+      if (!config) return;
+      const url = `https://api.sponteeducacional.net.br/WSAPIEdu.asmx/UpdateAlunos3`;
+      
+      const payload = {
+        nCodigoCliente: config.codigo,
+        sToken: config.token,
+        nAlunoID: aluno.id,
+        sNome: aluno.nome || '',
+        sEmail: '',
+        sMidia: '',
+        dDataNascimento: '',
+        sCidade: '',
+        sBairro: '',
+        sCEP: '',
+        sEndereco: '',
+        nNumeroEndereco: '',
+        sComplementoEndereco: '',
+        sCPF: '',
+        sRG: '',
+        nResponsavelFinanceiroID: '0',
+        nResponsavelDidaticoID: '0',
+        sTelefone: '',
+        sCelular: newPhoneValue.trim(),
+        sObservacao: '',
+        sSexo: '',
+        sProfissao: '',
+        sCidadeNatal: '',
+        sRa: '',
+        sNumeroMatricula: '',
+        sSituacao: '',
+        sCursoInteresse: '',
+        sInfoBloqueada: '',
+        sOrigemNome: '',
+        nOrigemID: '0'
+      };
+
+      const formData = new URLSearchParams();
+      Object.entries(payload).forEach(([key, val]) => formData.append(key, val));
+
+      console.log("Atualizando celular no Sponte...", payload);
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: formData.toString()
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`HTTP ${response.status}: ${errText.substring(0, 100)}`);
+      }
+
+      if (isGlobal) {
+        setGlobalDetalhes(prev => ({ ...prev, data: { ...prev.data, celular: newPhoneValue.trim() }}));
+      } else {
+        setSelectedAlunoDetails(prev => ({ ...prev, celular: newPhoneValue.trim() }));
+      }
+      setEditingPhone(false);
+    } catch (e) {
+      console.error("Erro ao atualizar o celular", e);
+      alert("Não foi possível atualizar o celular: " + e.message);
+    } finally {
+      setSavingPhone(false);
     }
   };
 
@@ -1360,6 +1500,7 @@ const App = () => {
     ? (filtroCompradores ? alunos.filter(a => a.material.comprou) : alunos)
     : (filtroVeteranos ? alunos.filter(a => a.material?.anosAnteriores && a.material.anosAnteriores.length > 0) : alunos);
 
+
   return (
     <div className={`min-h-screen transition-colors duration-500 ${isDarkMode ? 'dark bg-slate-950 text-slate-100' : 'bg-[#f3f4f6] text-slate-900'} p-4 md:p-8 font-sans antialiased selection:bg-orange-100 relative`}>
 
@@ -1783,21 +1924,62 @@ const App = () => {
                       </div>
 
                       <div
-                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-green-100 cursor-pointer transition-colors group"
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 hover:border-green-100 cursor-pointer transition-colors group relative"
                         onClick={() => {
+                          if (editingPhone) return;
                           navigator.clipboard.writeText(globalDetalhes.data.celular || '');
                           setCopiedField('celular');
                           setTimeout(() => setCopiedField(null), 2000);
                         }}
                       >
                         <div className="w-10 h-10 rounded-xl bg-green-50 flex items-center justify-center text-green-500 group-hover:bg-green-500 group-hover:text-white transition-colors"><Smartphone size={18} /></div>
-                        <div className="flex-1">
+                        <div className="flex-1 pr-12">
                           <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-0.5 flex items-center justify-between">
                             Celular
                             {copiedField === 'celular' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
                           </p>
-                          <p className="font-bold text-slate-700 text-sm group-hover:text-green-600 transition-colors">{globalDetalhes.data.celular}</p>
+                          {editingPhone ? (
+                            <div className="flex items-center gap-2 mt-1" onClick={e => e.stopPropagation()}>
+                              <input 
+                                type="text" 
+                                className="w-full text-sm font-bold text-slate-700 bg-white border border-slate-300 rounded px-2 py-1 outline-none focus:border-green-500"
+                                value={newPhoneValue}
+                                onChange={e => setNewPhoneValue(e.target.value)}
+                                autoFocus
+                              />
+                              <button 
+                                onClick={() => handleUpdatePhone(globalDetalhes.aluno, globalDetalhes.aluno.unidadeKey || globalDetalhes.aluno.unidades?.[0]?.unidadeKey, true)}
+                                disabled={savingPhone}
+                                className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50"
+                              >
+                                {savingPhone ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                              </button>
+                              <button 
+                                onClick={() => setEditingPhone(false)}
+                                className="p-1.5 bg-slate-200 text-slate-600 rounded hover:bg-slate-300"
+                              >
+                                <XCircle size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="font-bold text-slate-700 text-sm group-hover:text-green-600 transition-colors">{globalDetalhes.data.celular}</p>
+                          )}
                         </div>
+                        {!editingPhone && (
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setNewPhoneValue(globalDetalhes.data.celular !== '--' ? globalDetalhes.data.celular : '');
+                                setEditingPhone(true);
+                              }}
+                              className="p-1.5 bg-slate-100 hover:bg-green-50 text-slate-500 hover:text-green-600 rounded-lg transition-colors shadow-sm"
+                              title="Editar Celular"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100">
                         <div className="w-10 h-10 rounded-xl bg-slate-100 flex items-center justify-center text-slate-500"><LayoutList size={18} /></div>
@@ -2383,23 +2565,64 @@ const App = () => {
                       </div>
 
                       <div
-                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-green-100 dark:hover:border-green-900 transition-colors group cursor-pointer"
+                        className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 hover:border-green-100 dark:hover:border-green-900 transition-colors group cursor-pointer relative"
                         onClick={() => {
+                          if (editingPhone) return;
                           navigator.clipboard.writeText(selectedAlunoDetails.celular || '');
                           setCopiedField('celular_details');
                           setTimeout(() => setCopiedField(null), 2000);
                         }}
                       >
-                        <div className="w-10 h-10 rounded-xl bg-green-50 dark:bg-green-900/20 flex items-center justify-center text-green-500 dark:text-green-400 group-hover:bg-green-500 group-hover:text-white transition-colors">
+                        <div className="w-10 h-10 rounded-xl bg-green-50 dark:bg-green-900/20 flex items-center justify-center text-green-500 dark:text-orange-400 group-hover:bg-green-500 group-hover:text-white transition-colors">
                           <Smartphone size={18} />
                         </div>
-                        <div className="flex-1">
+                        <div className="flex-1 pr-12">
                           <p className="text-[9px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest mb-0.5 flex items-center justify-between">
                             Celular
                             {copiedField === 'celular_details' && <span className="text-green-500 text-[8px] animate-in fade-in slide-in-from-right-1 duration-200">COPIADO!</span>}
                           </p>
-                          <p className="font-bold text-slate-700 dark:text-slate-200 text-sm group-hover:text-green-600 transition-colors">{selectedAlunoDetails.celular}</p>
+                          {editingPhone ? (
+                            <div className="flex items-center gap-2 mt-1" onClick={e => e.stopPropagation()}>
+                              <input 
+                                type="text" 
+                                className="w-full text-sm font-bold text-slate-700 bg-white border border-slate-300 rounded px-2 py-1 outline-none focus:border-green-500"
+                                value={newPhoneValue}
+                                onChange={e => setNewPhoneValue(e.target.value)}
+                                autoFocus
+                              />
+                              <button 
+                                onClick={() => handleUpdatePhone(selectedAlunoDetails, selectedUnidade, false)}
+                                disabled={savingPhone}
+                                className="p-1.5 bg-green-500 text-white rounded hover:bg-green-600 disabled:opacity-50"
+                              >
+                                {savingPhone ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                              </button>
+                              <button 
+                                onClick={() => setEditingPhone(false)}
+                                className="p-1.5 bg-slate-200 text-slate-600 rounded hover:bg-slate-300"
+                              >
+                                <XCircle size={14} />
+                              </button>
+                            </div>
+                          ) : (
+                            <p className="font-bold text-slate-700 dark:text-slate-200 text-sm group-hover:text-green-600 transition-colors">{selectedAlunoDetails.celular}</p>
+                          )}
                         </div>
+                        {!editingPhone && (
+                          <div className="absolute right-4 top-1/2 -translate-y-1/2">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setNewPhoneValue(selectedAlunoDetails.celular !== '--' ? selectedAlunoDetails.celular : '');
+                                setEditingPhone(true);
+                              }}
+                              className="p-1.5 bg-slate-100 dark:bg-slate-800 hover:bg-green-50 dark:hover:bg-green-900/30 text-slate-500 dark:text-slate-400 hover:text-green-600 dark:hover:text-green-400 rounded-lg transition-colors shadow-sm"
+                              title="Editar Celular"
+                            >
+                              <Pencil size={14} />
+                            </button>
+                          </div>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-4 p-4 rounded-2xl border border-slate-100 dark:border-slate-800 transition-colors">
