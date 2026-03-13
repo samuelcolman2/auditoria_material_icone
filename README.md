@@ -86,7 +86,8 @@ Localizada em `App.jsx`, esta constante centraliza todas as requisições de red
 | `GetIntegrantesTurmas` | Lista alunos de uma turma específica |
 | `GetMatriculas` | Busca histórico de matrículas por aluno (para detectar anos anteriores) |
 | `GetFinanceiro` | Verifica se o aluno pagou o material didático |
-| `GetAlunos` | Busca dados detalhados do aluno (para exportação) |
+| `GetAlunos` | Busca dados detalhados do aluno (para exportação e pesquisa) |
+| `UpdateAlunos3` | Atualiza dados cadastrais (E-mail e Celular) no Sponte |
 | `GetNotaParcial` | Busca notas parciais e médias por aluno/turma/ano |
 
 ### Parâmetros importantes do `GetNotaParcial`
@@ -153,17 +154,19 @@ GET /WSAPIEdu.asmx/GetNotaParcial
 
 ### 3. 🌐 Pesquisa Global de Alunos (Modo Notas)
 
-- **Barra de Pesquisa Inteligente:** Localizada no topo da seção de Notas.
-- **Busca em Tempo Real (Autocomplete):** Pesquisa o nome do aluno simultaneamente nas **6 unidades** da escola via API `GetAlunos`.
-- **Dropdown de Resultados:** Exibe sugestões conforme você digita, mostrando o nome do aluno e a unidade correspondente.
+- **Pesquisa Global Turbinada**: O mesmo campo de busca aceita **Nome, E-mail ou Matrícula**.
+- **Detecção Inteligente**: Se o termo contiver "@", busca por e-mail; se contiver apenas números, busca por matrícula.
+- **Resultados Unificados**: Junta alunos encontrados em diferentes unidades e por diferentes critérios (Nome/Email/Matrícula) em uma lista limpa e sem repetições.
 - **Histórico Unificado:** Ao selecionar um aluno, o sistema abre um modal exclusivo que:
   - Busca matrículas em **todas** as unidades onde o aluno já estudou.
   - Consolida notas de diferentes anos e unidades em uma única visualização.
   - Permite filtrar por Ano e Trimestre/Bimestre.
   - Exibe a unidade e a turma de cada registro histórico.
+- **Edição de Dados (Direto no Sponte)**: Implementação de botões de edição (lápis) nos campos de **E-mail** e **Celular**.
+  - As alterações são persistidas em tempo real no banco de dados do Sponte via API.
 - **Botões de Cópia Direta:** Implementados nos campos Nome (header), Matrícula, Nascimento e CPF.
   - **Feedback:** Ícone de "check" verde por 2 segundos após a cópia.
-- **Visualização de Turma Atual:** Substituição do campo "Responsável" pela "Turma Atual" do aluno.
+- **Visualização de Turma Atual:** Substituição do campo "Responsável" pela "Turma Atual" do aluno (com lógica de priorização para o ano letivo corrente).
   - **Identificação Inteligente:** Para alunos inativos, o sistema percorre o histórico em todas as unidades para encontrar a última turma registrada.
 - **Visualização de Notas Parciais:** Badges laranja exibem o detalhamento (VAD, VAO, VAF) logo abaixo da média de cada disciplina.
 - **Menu de Configurações & Alunos Salvos:** A lista de alunos salvos foi movida para um menu de configurações (ícone de engrenagem) no topo superior direito. O menu permite ver, limpar e exportar os alunos salvos, otimizando o espaço da tela principal e removendo a barra lateral fixa.
@@ -240,8 +243,18 @@ Esse aviso aparece quando o aluno possui matrículas em anos anteriores registra
 O badge "VETERANO" aparece sempre que `GetMatriculas` retorna pelo menos uma matrícula anterior a 2026. Não garante que existam notas para aquele período.
 
 ### Múltiplas turmas no mesmo ano
-
 Caso um aluno tenha mudado de turma em 2025 (ex: transferência interna), o sistema consulta **todas** as TurmaIDs daquele ano e mescla os resultados, garantindo que nenhuma nota fique de fora.
+
+---
+
+## 🛠️ Correções Críticas e Melhorias Técnicas
+
+### 1. Deteção Resiliente da Turma Atual (Problema 2026)
+Havia um erro onde alunos ativos em 2026 apareciam como "Sem matrícula" ou com turmas de 2025.
+- **Solução**: Implementada a função `extractYear` que busca o ano letivo no `AnoLetivo`, nas datas de início e até no **Nome da Turma** via Regex.
+- **Resiliência**: Para alunos **Ativos**, o sistema agora sempre exibe a matrícula mais recente como "Atual" (fallback), garantindo que a informação visual esteja sempre presente.
+
+---
 
 ---
 
@@ -265,6 +278,9 @@ Caso um aluno tenha mudado de turma em 2025 (ex: transferência interna), o sist
 | 2026-03 | Adição de **Indicador de Status Ativo/Inativo** textual e colorido na busca global |
 | 2026-03 | Atualização do Modal: Substituição de 'Responsável' por **'Turma Atual'** |
 | 2026-03 | Melhoria: Busca exaustiva de matrícula em todas as unidades para alunos inativos |
+| 2026-03 | **Correção Crítica**: Lógica resiliente de detecção de ano (fix erro Turma Atual 2026) |
+| 2026-03 | **Feature**: Pesquisa Global expandida para E-mail e Matrícula |
+| 2026-03 | **Feature**: Edição de E-mail e Celular com persistência direta no Sponte |
 
 ---
 
